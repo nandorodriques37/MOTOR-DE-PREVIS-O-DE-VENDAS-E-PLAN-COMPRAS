@@ -1,0 +1,347 @@
+"""
+================================================================================
+ETAPA 4 - CÁLCULO DE NECESSIDADE DE COMPRA (PEDIDO)
+================================================================================
+Este script calcula a necessidade de compra (PEDIDO) para cada SKU/CD,
+garantindo que o ESTOQUE PROJETADO seja >= ESTOQUE OBJETIVO em todos os meses.
+
+-----------------------------------------------------------------------------
+LÓGICA DE CÁLCULO (Atualizada):
+-----------------------------------------------------------------------------
+ESTOQUE OBJETIVO = (Forward-Looking) Soma a demanda diária futura exata 
+                   para os próximos (LT + FREQUENCIA + EST_SEGURANCA) dias.
+PEDIDO = Quantidade a pedir no mês para garantir EST_OBJ no mês de chegada.
+ENTRADA = Pedidos que CHEGAM no mês (baseado na data do pedido + LT).
+ESTOQUE PROJETADO = Est.Anterior + Entrada - Sell Out.
+
+-----------------------------------------------------------------------------
+REGRA DE CHEGADA E CALENDÁRIO:
+-----------------------------------------------------------------------------
+- Mês 0 (Atual): Data de Pedido = Data de Hoje (Data Referência).
+- Mês 1 em diante: Data de Pedido = 1º dia do mês.
+- Data Chegada = Data do Pedido + LT dias.
+
+================================================================================
+"""
+
+import pandas as pd
+import numpy as np
+from datetime import datetime, timedelta
+from dateutil.relativedelta import relativedelta
+from openpyxl import Workbook
+from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+
+# =============================================================================
+# CONFIGURAÇÕES - ALTERAR CONFORME NECESSÁRIO
+# =============================================================================
+
+PATH_PREVISAO_SKU = r"\\files\Setores\SupplyChain\Forecast Fornecedores\2026\Teste Automatizado\ETAPA_3_PREVISAO_SKU.xlsx"
+PATH_ESTOQUE = r"\\files\Setores\SupplyChain\Forecast Fornecedores\2026\Teste Automatizado\FONTE_ESTOQUE.xlsx"
+PATH_OUTPUT = r"\\files\Setores\SupplyChain\Forecast Fornecedores\2026\Teste Automatizado\ETAPA_4_NECESSIDADE_COMPRA.xlsx"
+
+# Parâmetros de cálculo
+DIAS_MES = 30  # Dias do mês padronizado para cálculo de demanda
+HORIZONTE_MESES = 13  # Mês atual + 12 meses futuros
+DATA_REFERENCIA = datetime.now()  # Data de execução do script
+
+
+# =============================================================================
+# FUNÇÕES AUXILIARES
+# =============================================================================
+
+def calcular_dias_restantes_mes(data_ref):
+    """Calcula quantos dias restam no mês atual."""
+    ultimo_dia = (data_ref.replace(day=1) + relativedelta(months=1) - timedelta(days=1)).day
+    dias_restantes = ultimo_dia - data_ref.day + 1
+    return dias_restantes, ultimo_dia
+
+
+def gerar_lista_meses(data_ref, horizonte):
+    """Gera lista de meses no formato YYYY_MM a partir da data de referência."""
+    meses = []
+    for i in range(horizonte):
+        mes = data_ref + relativedelta(months=i)
+        meses.append(mes.strftime("%Y_%m"))
+    return meses
+
+
+def calcular_mes_chegada(data_pedido, lt_dias):
+    """Calcula o mês de chegada baseado na data do pedido e Lead Time."""
+    try:
+        lt = int(float(lt_dias)) if pd.notna(lt_dias) else 0
+    except:
+        lt = 0
+    data_chegada = data_pedido + timedelta(days=lt)
+    return data_chegada.strftime("%Y_%m")
+
+
+def safe_numeric(val, default=0):
+    """Converte valor para numérico de forma segura."""
+    try:
+        if pd.isna(val):
+            return default
+        if isinstance(val, str):
+            val = val.strip()
+            if val.lower() in ['(vazio)', 'vazio', '', 'nan', 'none']:
+                return default
+        return float(val)
+    except:
+        return default
+
+
+# =============================================================================
+# FUNÇÃO PRINCIPAL
+# =============================================================================
+
+def main():
+    print("=" * 70)
+    print("ETAPA 4 - CÁLCULO DE NECESSIDADE DE COMPRA (PEDIDO)")
+    print("⚠️ VERSÃO: FORWARD-LOOKING + CALENDÁRIO FIXO 1º DIA")
+    print("=" * 70)
+
+    # -------------------------------------------------------------------------
+    # 1. CARREGAR DADOS
+    # -------------------------------------------------------------------------
+    print("\n[1] Carregando arquivos...")
+    try:
+        df_previsao = pd.read_excel(PATH_PREVISAO_SKU)
+        df_estoque = pd.read_excel(PATH_ESTOQUE)
+    except FileNotFoundError as e:
+        print(f"\n❌ ERRO: Arquivo não encontrado!")
+        print(f"   {e}")
+        return
+
+    print(f"    - Previsão SKU: {df_previsao.shape[0]:,} linhas")
+    print(f"    - Estoque: {df_estoque.shape[0]:,} linhas")
+
+    # -------------------------------------------------------------------------
+    # 2. PREPARAR PARÂMETROS TEMPORAIS
+    # -------------------------------------------------------------------------
+    meses_horizonte = gerar_lista_meses(DATA_REFERENCIA, HORIZONTE_MESES)
+    # Extensão extra para o Forward-Looking (conseguir ler a demanda de meses à frente)
+    meses_horizonte_ext = gerar_lista_meses(DATA_REFERENCIA, HORIZONTE_MESES + 6) 
+
+    dias_restantes, dias_total = calcular_dias_restantes_mes(DATA_REFERENCIA)
+    proporcao_mes_atual = dias_restantes / dias_total
+
+    print(f"\n[2] Parâmetros temporais:")
+    print(f"    - Data referência: {DATA_REFERENCIA.strftime('%d/%m/%Y')}")
+    print(f"    - Dias restantes no mês: {dias_restantes} de {dias_total} ({proporcao_mes_atual:.1%})")
+
+    # -------------------------------------------------------------------------
+    # 3. PREPARAR DADOS DE ESTOQUE E PREVISÃO
+    # -------------------------------------------------------------------------
+    print("\n[3] Preparando dados...")
+    df_estoque = df_estoque.rename(columns={
+        'ESTOQUE ATUAL': 'ESTOQUE',
+        'LT (DIAS)': 'LT',
+        'FREQUENCIA (DIAS)': 'FREQUENCIA',
+        'ESTOQUE DE SEGURANÇA (DIAS)': 'EST_SEGURANCA'
+    })
+
+    for col in ['ESTOQUE', 'PENDENCIA', 'NNA', 'LT', 'FREQUENCIA', 'EST_SEGURANCA']:
+        df_estoque[col] = df_estoque[col].apply(safe_numeric)
+
+    meses_necessarios = set(meses_horizonte_ext)
+    df_prev_filtrado = df_previsao[df_previsao['ano_mes'].isin(meses_necessarios)]
+
+    df_pivot = df_prev_filtrado.pivot_table(
+        index=['codigo_deposito_pd', 'codigo_produto'],
+        columns='ano_mes', values='Previsao_Vendas', aggfunc='sum', fill_value=0
+    ).reset_index()
+
+    df_cadastro = df_previsao.groupby(['codigo_deposito_pd', 'codigo_produto']).agg({
+        'nome produto': 'first', 'fornecedor comercial': 'first',
+        'nome nível 3': 'first', 'nome nível 4': 'first', 'situacao': 'first'
+    }).reset_index()
+
+    df_pivot = df_pivot.merge(df_cadastro, on=['codigo_deposito_pd', 'codigo_produto'], how='left')
+    
+    df = df_pivot.merge(
+        df_estoque[['codigo_deposito_pd', 'codigo_produto', 'ESTOQUE', 'PENDENCIA', 'NNA', 'LT', 'FREQUENCIA', 'EST_SEGURANCA']],
+        on=['codigo_deposito_pd', 'codigo_produto'], how='inner'
+    )
+    df['CHAVE'] = df['codigo_deposito_pd'].astype(str) + '-' + df['codigo_produto'].astype(str)
+
+    if df.shape[0] == 0:
+        print("\n❌ ERRO: Nenhum registro encontrado após merge!")
+        return
+
+    # -------------------------------------------------------------------------
+    # 6. CALCULAR NECESSIDADE DE COMPRA
+    # -------------------------------------------------------------------------
+    print("\n[4] Calculando necessidade de compra (Forward-Looking e Calendário Ajustado)...")
+    linhas_output = []
+
+    for idx, row in df.iterrows():
+        cadastro = {
+            'fornecedor comercial': row.get('fornecedor comercial', ''),
+            'situacao': row.get('situacao', ''), 'CHAVE': row['CHAVE'],
+            'codigo_deposito_pd': row['codigo_deposito_pd'], 'codigo_produto': row['codigo_produto'],
+            'nome produto': row.get('nome produto', ''), 'nome nível 3': row.get('nome nível 3', ''),
+            'nome nível 4': row.get('nome nível 4', ''), 'ESTOQUE': row['ESTOQUE'],
+            'PENDENCIA': row['PENDENCIA'], 'LT': row['LT'], 'NNA': row['NNA'],
+            'FREQUENCIA': row['FREQUENCIA'], 'EST_SEGURANCA': row['EST_SEGURANCA']
+        }
+
+        estoque_atual = safe_numeric(row['ESTOQUE'])
+        pendencia = safe_numeric(row['PENDENCIA'])
+        nna = safe_numeric(row['NNA'])
+        lt = safe_numeric(row['LT'])
+        frequencia = safe_numeric(row['FREQUENCIA'])
+        est_seguranca = safe_numeric(row['EST_SEGURANCA'])
+
+        estoque_inicial = estoque_atual + pendencia + nna
+        dias_cobertura = lt + frequencia + est_seguranca
+
+        # 1. Calcular SELL_OUT e EST_OBJ (Forward-Looking)
+        est_obj_por_mes = {}
+        sell_out_por_mes = {}
+
+        for i, mes in enumerate(meses_horizonte):
+            # Sell Out
+            so = safe_numeric(row.get(mes, 0))
+            if i == 0:
+                so = so * proporcao_mes_atual
+            sell_out_por_mes[mes] = so
+
+            # Estoque Objetivo: Consumindo a demanda dos próximos X dias (Forward-Looking)
+            dias_rest = dias_cobertura
+            demanda_forward = 0
+            
+            for j in range(i, len(meses_horizonte_ext)):
+                mes_futuro = meses_horizonte_ext[j]
+                demanda_futura = safe_numeric(row.get(mes_futuro, 0))
+                
+                if dias_rest >= DIAS_MES:
+                    demanda_forward += demanda_futura
+                    dias_rest -= DIAS_MES
+                else:
+                    demanda_forward += demanda_futura * (dias_rest / DIAS_MES)
+                    dias_rest = 0
+                    break
+                    
+            # Se faltar horizonte na tabela, extrapola com o último mês conhecido
+            if dias_rest > 0:
+                ultimo_mes_disp = meses_horizonte_ext[-1]
+                demanda_ult = safe_numeric(row.get(ultimo_mes_disp, 0))
+                demanda_forward += (demanda_ult / DIAS_MES) * dias_rest
+                
+            est_obj_por_mes[mes] = demanda_forward
+
+        # 2. Calcular mês de chegada corrigido (Mês atual = Hoje; Meses futuros = Dia 1º)
+        mes_chegada_por_mes_pedido = {}
+        for i, mes in enumerate(meses_horizonte):
+            if i == 0:
+                data_pedido = DATA_REFERENCIA 
+            else:
+                data_pedido = (DATA_REFERENCIA + relativedelta(months=i)).replace(day=1)
+                
+            mes_chegada_por_mes_pedido[mes] = calcular_mes_chegada(data_pedido, lt)
+
+        # 3. Calcular Entradas e Pedidos Mês a Mês
+        pedidos = {mes: 0 for mes in meses_horizonte}
+        entradas = {mes: 0 for mes in meses_horizonte_ext}
+        estoque_anterior = estoque_inicial
+
+        for i, mes in enumerate(meses_horizonte):
+            sell_out = sell_out_por_mes[mes]
+            est_proj_sem_pedido = estoque_anterior + entradas.get(mes, 0) - sell_out
+            est_obj = est_obj_por_mes[mes]
+            mes_chegada = mes_chegada_por_mes_pedido[mes]
+
+            if est_proj_sem_pedido < est_obj:
+                necessidade_este_mes = est_obj - est_proj_sem_pedido
+                if mes_chegada == mes:
+                    pedidos[mes] = necessidade_este_mes
+                    entradas[mes] += necessidade_este_mes
+
+            if mes_chegada != mes and mes_chegada in est_obj_por_mes:
+                est_proj_chegada = est_proj_sem_pedido
+                if mes_chegada == mes:
+                    est_proj_chegada += pedidos.get(mes, 0)
+
+                for j in range(i + 1, len(meses_horizonte)):
+                    mes_j = meses_horizonte[j]
+                    if mes_j == mes_chegada:
+                        est_proj_chegada = est_proj_chegada + entradas.get(mes_chegada, 0) - sell_out_por_mes.get(mes_chegada, 0)
+                        break
+                    else:
+                        est_proj_chegada = est_proj_chegada + entradas.get(mes_j, 0) - sell_out_por_mes.get(mes_j, 0)
+
+                est_obj_chegada = est_obj_por_mes.get(mes_chegada, 0)
+                if est_proj_chegada < est_obj_chegada:
+                    necessidade_chegada = est_obj_chegada - est_proj_chegada
+                    pedidos[mes] = max(pedidos[mes], necessidade_chegada)
+                    entradas[mes_chegada] += necessidade_chegada
+
+            estoque_anterior = estoque_anterior + entradas.get(mes, 0) - sell_out
+
+        # 4. Consolidar Linhas de Resultado
+        estoque_anterior = estoque_inicial
+        for i, mes in enumerate(meses_horizonte):
+            sell_out = sell_out_por_mes[mes]
+            entrada_mes = entradas.get(mes, 0)
+            est_proj = estoque_anterior + entrada_mes - sell_out
+
+            linha = cadastro.copy()
+            linha.update({
+                'MES_ANO': mes,
+                'SELL_OUT': round(sell_out, 0),
+                'ESTOQUE_PROJETADO': round(est_proj, 0),
+                'ESTOQUE_OBJETIVO': round(est_obj_por_mes[mes], 0),
+                'PEDIDO': round(pedidos[mes], 0),
+                'ENTRADA': round(entrada_mes, 0)
+            })
+            linhas_output.append(linha)
+            estoque_anterior = est_proj
+
+    # -------------------------------------------------------------------------
+    # 7. EXPORTAR PARA EXCEL
+    # -------------------------------------------------------------------------
+    df_output = pd.DataFrame(linhas_output)
+    colunas_ordem = [
+        'fornecedor comercial', 'situacao', 'CHAVE', 'codigo_deposito_pd',
+        'codigo_produto', 'nome produto', 'nome nível 3', 'nome nível 4',
+        'ESTOQUE', 'PENDENCIA', 'LT', 'NNA', 'FREQUENCIA', 'EST_SEGURANCA',
+        'MES_ANO', 'SELL_OUT', 'ESTOQUE_PROJETADO', 'ESTOQUE_OBJETIVO', 'PEDIDO', 'ENTRADA'
+    ]
+    df_output = df_output[colunas_ordem]
+
+    print("\n[5] Exportando para Excel...")
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Necessidade_Compra"
+
+    header_fill = PatternFill('solid', fgColor='366092')
+    header_font = Font(bold=True, color='FFFFFF')
+    border = Border(left=Side(style='thin'), right=Side(style='thin'), top=Side(style='thin'), bottom=Side(style='thin'))
+
+    for col_idx, col_name in enumerate(df_output.columns, 1):
+        cell = ws.cell(row=1, column=col_idx, value=col_name)
+        cell.fill = header_fill
+        cell.font = header_font
+        cell.alignment = Alignment(horizontal='center')
+        cell.border = border
+
+    for row_idx, (_, row) in enumerate(df_output.iterrows(), 2):
+        for col_idx, col_name in enumerate(df_output.columns, 1):
+            cell = ws.cell(row=row_idx, column=col_idx, value=row[col_name])
+            cell.border = border
+            if col_name in ['SELL_OUT', 'ESTOQUE_PROJETADO', 'ESTOQUE_OBJETIVO', 'PEDIDO', 'ENTRADA', 'ESTOQUE', 'PENDENCIA', 'LT', 'NNA', 'FREQUENCIA', 'EST_SEGURANCA']:
+                cell.number_format = '#,##0'
+
+    for col, width in zip("ABCDEFGHIJKLMNOPQRST", [18, 8, 12, 6, 10, 35, 18, 20, 10, 10, 6, 6, 10, 10, 10, 12, 15, 15, 12, 12]):
+        ws.column_dimensions[col].width = width
+
+    ws.freeze_panes = 'A2'
+    ws.auto_filter.ref = ws.dimensions
+    wb.save(PATH_OUTPUT)
+
+    print(f"    ✓ Arquivo salvo: {PATH_OUTPUT}")
+    print("\n" + "=" * 70)
+    print("✅ ETAPA 4 CONCLUÍDA COM SUCESSO!")
+    print("=" * 70)
+
+if __name__ == "__main__":
+    main()
