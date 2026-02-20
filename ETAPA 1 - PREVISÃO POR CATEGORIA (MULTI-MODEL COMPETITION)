@@ -1,0 +1,809 @@
+"""
+================================================================================
+ETAPA 1 - PREVISÃO POR CATEGORIA (MULTI-MODEL COMPETITION)
+================================================================================
+
+Este script implementa um sistema de competição entre múltiplos modelos de
+previsão, selecionando automaticamente o melhor para cada Fornecedor/Categoria.
+
+⚠️ VERSÃO: EXCEÇÕES POR NÍVEL 4 (Venda Considerada)
+   - Lê uma tabela de parâmetros para decidir entre Venda Bruta ou Regular.
+   - Aplica a regra no Nível 4 e consolida o aprendizado no Nível 3.
+
+MODELOS INCLUÍDOS:
+- ETS (Exponential Smoothing / Holt-Winters)
+- SARIMA (Seasonal ARIMA)
+- Prophet (Facebook)
+- Theta (Theta Method)
+
+MÉTODO DE SELEÇÃO:
+- Rolling Window com 3 janelas de validação
+- Métrica: wMAPE (Weighted MAPE - Ponderado pelo Volume)
+- Governança Anti-Chapada: Rejeita linhas sem oscilação.
+
+Autor: Equipe Supply Chain
+Data: Fevereiro/2026
+Versão: 5.0 (Regra Parametrizada Nível 4 + Venda Considerada)
+================================================================================
+"""
+
+# =============================================================================
+# SUPRIMIR WARNINGS - DEVE SER ANTES DE TUDO
+# =============================================================================
+import warnings
+import sys
+import os
+import multiprocessing
+import logging
+
+if not sys.warnoptions:
+    warnings.simplefilter("ignore")
+    os.environ["PYTHONWARNINGS"] = "ignore"
+
+warnings.filterwarnings('ignore', category=DeprecationWarning)
+warnings.filterwarnings('ignore', category=FutureWarning)
+warnings.filterwarnings('ignore', category=UserWarning)
+warnings.filterwarnings('ignore', message='.*convergence.*')
+warnings.filterwarnings('ignore', message='.*Maximum Likelihood.*')
+
+try:
+    from statsmodels.tools.sm_exceptions import ConvergenceWarning
+
+    warnings.filterwarnings('ignore', category=ConvergenceWarning)
+except ImportError:
+    pass
+
+os.environ['CMDSTAN_VERBOSE'] = 'FALSE'
+os.environ['STAN_NUM_THREADS'] = '1'
+
+for logger_name in ['cmdstanpy', 'prophet', 'statsmodels', 'pystan', 'stan', 'prophet.plot']:
+    _logger = logging.getLogger(logger_name)
+    _logger.setLevel(logging.CRITICAL)
+    _logger.propagate = False
+    _logger.addHandler(logging.NullHandler())
+
+import pandas as pd
+import numpy as np
+from datetime import datetime
+
+try:
+    from joblib import Parallel, delayed
+
+    JOBLIB_AVAILABLE = True
+except ImportError:
+    JOBLIB_AVAILABLE = False
+    print("⚠️ Joblib não instalado. Processamento será sequencial.")
+
+from statsmodels.tsa.holtwinters import ExponentialSmoothing
+from statsmodels.tsa.statespace.sarimax import SARIMAX
+from statsmodels.tsa.forecasting.theta import ThetaModel
+
+try:
+    from prophet import Prophet
+
+    PROPHET_AVAILABLE = True
+except ImportError:
+    PROPHET_AVAILABLE = False
+
+# =============================================================================
+# CONFIGURAÇÕES
+# =============================================================================
+
+# Caminhos dos arquivos (AJUSTE O PATH_PARAMETROS CONFORME SEU ARQUIVO)
+PATH_INPUT = r"\\files\Setores\SupplyChain\Forecast Fornecedores\2026\Teste Automatizado\ETAPA_0_HISTORICO.xlsx"
+PATH_PARAMETROS = r"\\files\Setores\SupplyChain\Forecast Fornecedores\2026\Teste Automatizado\FONTE_PARAMETROS.xlsx"
+PATH_OUTPUT = r"\\files\Setores\SupplyChain\Forecast Fornecedores\2026\Teste Automatizado\ETAPA_1_PREVISAO_CATEGORIA.xlsx"
+
+FORECAST_HORIZON = 24
+SEASONAL_PERIOD = 12
+
+N_ROLLING_WINDOWS = 3
+VALIDATION_SIZE = 3
+MIN_TRAIN_SIZE = 12
+
+PROMO_TOL = 0.20
+DEBUG = False
+
+
+# =============================================================================
+# CARREGAMENTO E AUTO-FIX
+# =============================================================================
+
+def carregar_dados():
+    """Carrega as bases históricas e de parâmetros, garantindo a padronização das colunas."""
+    print("\n[0] Carregando dados...")
+    try:
+        df = pd.read_excel(PATH_INPUT)
+        print(f"    - Histórico carregado: {len(df):,} linhas")
+    except FileNotFoundError:
+        print(f"❌ Arquivo de Histórico não encontrado: {PATH_INPUT}")
+        sys.exit(1)
+
+    try:
+        df_params = pd.read_excel(PATH_PARAMETROS)
+        print(f"    - Parâmetros carregados: {len(df_params):,} linhas")
+    except FileNotFoundError:
+        print(f"    ⚠️ Arquivo de parâmetros não encontrado: {PATH_PARAMETROS}")
+        print("       O script seguirá usando Venda Regular para todos os grupos.")
+        df_params = pd.DataFrame(columns=['fornecedor comercial', 'nome nível 3', 'nome nível 4', 'VENDA USAR'])
+
+    # Limpar espaços invisíveis nos cabeçalhos e forçar maiúsculas para o DE-PARA
+    df.columns = df.columns.str.strip()
+    df_params.columns = df_params.columns.str.strip().str.upper()
+
+    # Dicionário de Correção para DF Histórico
+    mapa_correcao_df = {
+        'Fornecedor Comercial': 'fornecedor comercial',
+        'Fornecedor': 'fornecedor comercial',
+        'fornecedor': 'fornecedor comercial',
+        'FORNECEDOR': 'fornecedor comercial',
+        'Categoria': 'nome nível 3',
+        'Nome Nível 3': 'nome nível 3',
+        'Nome Nível 4': 'nome nível 4'
+    }
+    df = df.rename(columns=mapa_correcao_df)
+
+    # Dicionário de Correção para Parâmetros (Cobrindo todas as variações possíveis)
+    mapa_params = {
+        'FORNECEDOR': 'fornecedor comercial',
+        'FORNECEDOR COMERCIAL': 'fornecedor comercial',
+        'CATEGORIA NIVEL 3': 'nome nível 3',
+        'CATEGORIA NÍVEL 3': 'nome nível 3',
+        'NOME NIVEL 3': 'nome nível 3',
+        'NOME NÍVEL 3': 'nome nível 3',
+        'CATEGORIA NIVEL 4': 'nome nível 4',
+        'CATEGORIA NÍVEL 4': 'nome nível 4',
+        'NOME NIVEL 4': 'nome nível 4',
+        'NOME NÍVEL 4': 'nome nível 4',
+        'VENDA USAR': 'VENDA USAR'
+    }
+    df_params = df_params.rename(columns=mapa_params)
+
+    # ==========================================
+    # TRAVA DE SEGURANÇA: Validar colunas da planilha de Parâmetros
+    # ==========================================
+    colunas_obrigatorias = ['fornecedor comercial', 'nome nível 3', 'nome nível 4', 'VENDA USAR']
+    colunas_faltantes = [col for col in colunas_obrigatorias if col not in df_params.columns]
+
+    if colunas_faltantes and len(df_params) > 0:
+        print("\n" + "=" * 70)
+        print("❌ ERRO DE CABEÇALHO NA PLANILHA DE PARÂMETROS!")
+        print("=" * 70)
+        print(f"   O script não conseguiu identificar as seguintes colunas obrigatórias:")
+        for col in colunas_faltantes:
+            print(f"   -> Esperado: '{col}'")
+        print(f"\n   Colunas que o Python conseguiu ler no seu arquivo Excel:")
+        print(f"   {list(df_params.columns)}")
+        print("\n   Ação: Abra o arquivo ETAPA_0_PARAMETROS.xlsx e corrija os nomes da primeira linha.")
+        sys.exit(1)
+
+    # Limpar valores (strings) para o cruzamento funcionar perfeitamente
+    for col in ['fornecedor comercial', 'nome nível 3', 'nome nível 4']:
+        if col in df_params.columns:
+            df_params[col] = df_params[col].astype(str).str.strip()
+        if col in df.columns:
+            df[col] = df[col].astype(str).str.strip()
+
+    return df, df_params
+
+
+# =============================================================================
+# FUNÇÕES DE MÉTRICAS E PREPARAÇÃO DE DADOS
+# =============================================================================
+
+def calculate_wmape(y_true, y_pred):
+    y_true = np.array(y_true).flatten()
+    y_pred = np.array(y_pred).flatten()
+    soma_real = np.sum(y_true)
+    if soma_real == 0:
+        return np.inf
+    return (np.sum(np.abs(y_true - y_pred)) / soma_real) * 100
+
+
+def prepare_data(df, df_params):
+    """Aplica a regra de Venda Bruta vs Regular no Nível 4 e consolida no Nível 3."""
+    print("\n[1] Aplicando regras de Venda Bruta/Regular (Nível 4)...")
+
+    if 'data' in df.columns:
+        df['data'] = pd.to_datetime(df['data'])
+    if 'ano_mes' not in df.columns and 'data' in df.columns:
+        df['ano_mes'] = df['data'].dt.strftime('%Y_%m')
+
+    if 'VENDA USAR' not in df_params.columns:
+        df_params['VENDA USAR'] = 'REGULAR'
+
+    # 1. Agregar dados no Nível 4
+    df_n4 = df.groupby(['fornecedor comercial', 'nome nível 3', 'nome nível 4', 'ano_mes']).agg({
+        'Qtd Bruta': 'sum'
+    }).reset_index()
+
+    # 2. Detectar Venda Regular cirurgicamente no Nível 4
+    df_n4['MÊS'] = df_n4['ano_mes'].str[-2:].astype(int)
+    df_n4['baseline'] = df_n4.groupby(['fornecedor comercial', 'nome nível 3', 'nome nível 4', 'MÊS'])[
+        'Qtd Bruta'].transform('median')
+    df_n4['Venda Regular'] = np.minimum(df_n4['Qtd Bruta'], df_n4['baseline'] * (1 + PROMO_TOL))
+
+    # 3. Cruzar com a tabela de parâmetros
+    df_n4 = pd.merge(
+        df_n4,
+        df_params[['fornecedor comercial', 'nome nível 3', 'nome nível 4', 'VENDA USAR']],
+        on=['fornecedor comercial', 'nome nível 3', 'nome nível 4'],
+        how='left'
+    )
+
+    # 4. Definir a Venda Considerada com base na regra
+    df_n4['VENDA USAR'] = df_n4['VENDA USAR'].fillna('REGULAR').astype(str).str.strip().str.upper()
+    df_n4['Venda Considerada'] = np.where(
+        df_n4['VENDA USAR'] == 'BRUTA',
+        df_n4['Qtd Bruta'],
+        df_n4['Venda Regular']
+    )
+
+    # 5. Agregar tudo de volta para o Nível 3 (Granularidade do Modelo Etapa 1)
+    df_agg = df_n4.groupby(['fornecedor comercial', 'nome nível 3', 'ano_mes']).agg({
+        'Qtd Bruta': 'sum',
+        'Venda Regular': 'sum',
+        'Venda Considerada': 'sum',
+        'baseline': 'sum'
+    }).reset_index()
+
+    df_agg = df_agg.rename(columns={
+        'nome nível 3': 'categoria',
+        'Qtd Bruta': 'Soma de Qtd Bruta',
+        'baseline': 'Média Mês Normal'
+    })
+
+    print(
+        f"    - Combinações consolidadas no Nível 3: {df_agg.groupby(['fornecedor comercial', 'categoria']).ngroups:,}")
+    return df_agg
+
+
+# =============================================================================
+# MODELOS DE PREVISÃO E SELEÇÃO (Inalterados)
+# =============================================================================
+
+class ModelETS:
+    def __init__(self):
+        self.name = "ETS"
+        self.model = None
+        self.fitted = None
+        self.aicc = np.inf
+        self.best_config = None
+
+    def fit(self, y_train, dates=None):
+        y_train = np.array(y_train).flatten()
+        best_aicc = np.inf
+        best_model = None
+        best_config = None
+        configs = [
+            {'trend': None, 'seasonal': None, 'damped_trend': False},
+            {'trend': 'add', 'seasonal': None, 'damped_trend': False},
+            {'trend': 'add', 'seasonal': None, 'damped_trend': True},
+        ]
+        if len(y_train) >= 2 * SEASONAL_PERIOD:
+            configs.extend([
+                {'trend': 'add', 'seasonal': 'add', 'damped_trend': False},
+                {'trend': 'add', 'seasonal': 'add', 'damped_trend': True},
+                {'trend': 'add', 'seasonal': 'mul', 'damped_trend': False},
+                {'trend': 'add', 'seasonal': 'mul', 'damped_trend': True},
+            ])
+        for config in configs:
+            try:
+                seasonal = config['seasonal']
+                seasonal_periods = SEASONAL_PERIOD if seasonal else None
+                model = ExponentialSmoothing(
+                    y_train, trend=config['trend'], seasonal=seasonal,
+                    seasonal_periods=seasonal_periods, damped_trend=config['damped_trend'],
+                    initialization_method='estimated'
+                )
+                fitted = model.fit(optimized=True)
+                if hasattr(fitted, 'aicc') and fitted.aicc < best_aicc:
+                    best_aicc = fitted.aicc
+                    best_model = fitted
+                    best_config = config
+            except Exception:
+                continue
+        if best_model is None:
+            raise ValueError("Nenhuma configuração ETS convergiu")
+        self.fitted = best_model
+        self.aicc = best_aicc
+        self.best_config = best_config
+        return self
+
+    def predict(self, horizon):
+        if self.fitted is None:
+            raise ValueError("Modelo não treinado")
+        return np.array(self.fitted.forecast(horizon)).flatten()
+
+    def get_info(self):
+        if self.best_config:
+            trend = self.best_config['trend'] or 'N'
+            seasonal = self.best_config['seasonal'] or 'N'
+            damped = 'd' if self.best_config['damped_trend'] else ''
+            t_str = trend[0].upper() if trend != 'N' else 'N'
+            s_str = seasonal[0].upper() if seasonal != 'N' else 'N'
+            return f"ETS({t_str}{damped},{s_str})"
+        return "ETS"
+
+
+class ModelSARIMA:
+    def __init__(self):
+        self.name = "SARIMA"
+        self.model = None
+        self.fitted = None
+        self.aicc = np.inf
+        self.best_order = None
+        self.best_seasonal = None
+
+    def fit(self, y_train, dates=None):
+        y_train = np.array(y_train).flatten()
+        best_aicc = np.inf
+        best_model = None
+        best_order = None
+        best_seasonal = None
+        orders = [(1, 1, 1), (0, 1, 1), (1, 1, 0), (1, 0, 1), (0, 1, 2)]
+        seasonal_orders = [(1, 1, 1, SEASONAL_PERIOD), (0, 1, 1, SEASONAL_PERIOD)] if len(
+            y_train) >= 2 * SEASONAL_PERIOD else [(0, 0, 0, 0)]
+        for order in orders:
+            for seasonal in seasonal_orders:
+                try:
+                    model = SARIMAX(y_train, order=order, seasonal_order=seasonal, enforce_stationarity=False,
+                                    enforce_invertibility=False)
+                    fitted = model.fit(disp=False, maxiter=50)
+                    aic = fitted.aic
+                    n = len(y_train)
+                    k = sum(order) + sum(seasonal[:3])
+                    aicc = aic + (2 * k * (k + 1)) / max(n - k - 1, 1)
+                    if aicc < best_aicc:
+                        best_aicc = aicc
+                        best_model = fitted
+                        best_order = order
+                        best_seasonal = seasonal
+                except Exception:
+                    continue
+        if best_model is None:
+            raise ValueError("Nenhuma configuração SARIMA convergiu")
+        self.fitted = best_model
+        self.aicc = best_aicc
+        self.best_order = best_order
+        self.best_seasonal = best_seasonal
+        return self
+
+    def predict(self, horizon):
+        if self.fitted is None:
+            raise ValueError("Modelo não treinado")
+        return np.array(self.fitted.forecast(horizon)).flatten()
+
+    def get_info(self):
+        if self.best_order and self.best_seasonal:
+            return f"SARIMA{self.best_order}x{self.best_seasonal}"
+        return "SARIMA"
+
+
+class ModelProphet:
+    def __init__(self):
+        self.name = "Prophet"
+        self.model = None
+        self.aicc = 1e6
+        self.train_dates = None
+
+    def fit(self, y_train, dates=None):
+        if not PROPHET_AVAILABLE:
+            raise ValueError("Prophet não está instalado")
+        y_train = np.array(y_train).flatten()
+        if len(y_train) < 2:
+            raise ValueError("Dados insuficientes para Prophet")
+        if dates is None:
+            dates = pd.date_range(end=datetime.now(), periods=len(y_train), freq='MS')
+        self.train_dates = dates
+        df = pd.DataFrame({'ds': pd.to_datetime(dates), 'y': y_train.astype(float)})
+        if df['y'].isna().all() or (df['y'] == 0).all():
+            raise ValueError("Dados inválidos para Prophet (todos nulos ou zeros)")
+        logger_cmdstanpy = logging.getLogger('cmdstanpy')
+        prev_level = logger_cmdstanpy.level
+        logger_cmdstanpy.setLevel(logging.CRITICAL)
+        last_error = None
+        for attempt in range(2):
+            try:
+                self.model = Prophet(yearly_seasonality=True, weekly_seasonality=False, daily_seasonality=False,
+                                     seasonality_mode='multiplicative', uncertainty_samples=0)
+                self.model.fit(df)
+                last_error = None
+                break
+            except Exception as e:
+                last_error = e
+                continue
+        logger_cmdstanpy.setLevel(prev_level)
+        if last_error is not None:
+            raise last_error
+        try:
+            fitted_df = self.model.predict(df)
+            residuals = df['y'].values - fitted_df['yhat'].values
+            n, k = len(y_train), 5
+            rss = np.sum(residuals ** 2)
+            self.aicc = n * np.log(rss / n) + 2 * k + (2 * k * (k + 1)) / max(n - k - 1,
+                                                                              1) if rss > 0 and n > k + 1 else 1e6
+        except Exception:
+            self.aicc = 1e6
+        return self
+
+    def predict(self, horizon):
+        if self.model is None:
+            raise ValueError("Modelo não treinado")
+        last_date = pd.to_datetime(self.train_dates.iloc[-1]) if hasattr(self.train_dates, 'iloc') else pd.to_datetime(
+            self.train_dates[-1])
+        future_dates = pd.date_range(start=last_date + pd.DateOffset(months=1), periods=horizon, freq='MS')
+        forecast = self.model.predict(pd.DataFrame({'ds': future_dates}))
+        return np.array(forecast['yhat'].values).flatten()
+
+    def get_info(self):
+        return "Prophet"
+
+
+class ModelTheta:
+    def __init__(self):
+        self.name = "Theta"
+        self.model = None
+        self.fitted = None
+        self.aicc = np.inf
+
+    def fit(self, y_train, dates=None):
+        y_train = np.array(y_train).flatten()
+        period = SEASONAL_PERIOD if len(y_train) >= 2 * SEASONAL_PERIOD else None
+        self.model = ThetaModel(pd.Series(y_train), period=period)
+        self.fitted = self.model.fit()
+        if hasattr(self.fitted, 'fittedvalues'):
+            residuals = y_train - self.fitted.fittedvalues.values
+            n, k = len(y_train), 2
+            rss = np.sum(residuals ** 2)
+            if rss > 0 and n > k + 1:
+                self.aicc = n * np.log(rss / n) + 2 * k + (2 * k * (k + 1)) / max(n - k - 1, 1)
+        return self
+
+    def predict(self, horizon):
+        if self.fitted is None:
+            raise ValueError("Modelo não treinado")
+        return np.array(self.fitted.forecast(horizon)).flatten()
+
+    def get_info(self):
+        return "Theta"
+
+
+def rolling_window_validation(y_series, dates, n_windows=3, val_size=3):
+    n = len(y_series)
+    windows = []
+    for i in range(n_windows):
+        val_end = n - i * val_size
+        val_start = val_end - val_size
+        train_end = val_start
+        if train_end < MIN_TRAIN_SIZE:
+            continue
+        windows.append((y_series[:train_end], y_series[val_start:val_end], dates[:train_end], dates[val_start:val_end]))
+    return windows
+
+
+def select_best_model(y_series, dates, debug_info=None):
+    y_series = np.array(y_series).flatten()
+    windows = rolling_window_validation(y_series, dates, N_ROLLING_WINDOWS, VALIDATION_SIZE)
+
+    if len(windows) == 0:
+        model = ModelETS()
+        model.fit(y_series)
+        return model, {'modelo': 'ETS (fallback)', 'wmape': None, 'aicc': model.aicc, 'all_results': {}}
+
+    model_classes = [('ETS', ModelETS), ('SARIMA', ModelSARIMA), ('Theta', ModelTheta)]
+    if PROPHET_AVAILABLE:
+        model_classes.append(('Prophet', ModelProphet))
+
+    results = {}
+    errors_debug = {}
+
+    for model_name, ModelClass in model_classes:
+        wmapes = []
+        aiccs = []
+        window_errors = []
+        for w_idx, (y_train, y_val, dates_train, dates_val) in enumerate(windows):
+            try:
+                model = ModelClass()
+                model.fit(y_train, dates_train)
+                y_pred = np.maximum(model.predict(len(y_val)), 0)
+                wmape = calculate_wmape(y_val, y_pred)
+                if not np.isinf(wmape) and not np.isnan(wmape):
+                    wmapes.append(wmape)
+                    aiccs.append(model.aicc if not np.isinf(model.aicc) else 1e10)
+            except Exception as e:
+                window_errors.append(f"Janela {w_idx + 1}: {str(e)[:100]}")
+                continue
+        if len(wmapes) > 0:
+            results[model_name] = {
+                'wmape_mean': np.mean(wmapes),
+                'wmape_std': np.std(wmapes) if len(wmapes) > 1 else 0,
+                'aicc_mean': np.mean(aiccs),
+                'n_windows': len(wmapes),
+                'class': ModelClass
+            }
+        if DEBUG and len(window_errors) > 0:
+            errors_debug[model_name] = window_errors
+
+    if len(results) == 0:
+        try:
+            model = ModelETS()
+            model.fit(y_series)
+            return model, {'modelo': 'ETS (fallback-erro)', 'wmape': None, 'aicc': model.aicc, 'all_results': {},
+                           'errors': errors_debug}
+        except:
+            return None, {'modelo': 'FALHA', 'wmape': None, 'aicc': None, 'all_results': {}, 'errors': errors_debug}
+
+    sorted_models = sorted(results.keys(), key=lambda x: (results[x]['wmape_mean'], results[x]['aicc_mean']))
+    best_model_name = None
+    best_result = None
+    rejected_flat = []
+    cv_hist = np.std(y_series) / np.mean(y_series) if np.mean(y_series) > 0 else 0
+
+    for candidate_name in sorted_models:
+        candidate_result = results[candidate_name]
+        CandidateClass = candidate_result['class']
+        try:
+            candidate_model = CandidateClass()
+            candidate_model.fit(y_series, dates)
+            candidate_forecast = np.maximum(candidate_model.predict(FORECAST_HORIZON), 0)
+        except:
+            continue
+
+        media_prev = np.mean(candidate_forecast)
+        if media_prev > 0:
+            diffs = np.diff(candidate_forecast)
+            variacao_ondas = np.std(diffs) / media_prev
+            is_flat = variacao_ondas < 0.015
+        else:
+            is_flat = True
+
+        if is_flat and cv_hist > 0.10:
+            rejected_flat.append(
+                f"{candidate_name} (Sem onda: var {variacao_ondas:.4f}, wMAPE {candidate_result['wmape_mean']:.1f}%)")
+            continue
+
+        best_model_name = candidate_name
+        best_result = candidate_result
+        break
+
+    if best_model_name is None:
+        if len(y_series) >= 2 * SEASONAL_PERIOD:
+            try:
+                forced_model = ModelETS()
+                forced_model.fitted = ExponentialSmoothing(
+                    y_series, trend='add', seasonal='add', seasonal_periods=SEASONAL_PERIOD, damped_trend=False,
+                    initialization_method='estimated'
+                ).fit(optimized=True)
+                forced_model.best_config = {'trend': 'add', 'seasonal': 'add', 'damped_trend': False}
+                return forced_model, {
+                    'modelo': 'ETS (Forçado Sazonal)', 'wmape': results[sorted_models[0]]['wmape_mean'], 'wmape_std': 0,
+                    'aicc': forced_model.fitted.aicc if hasattr(forced_model.fitted, 'aicc') else 0,
+                    'all_results': results, 'errors': errors_debug if DEBUG else {}, 'rejected_flat': rejected_flat
+                }
+            except Exception:
+                pass
+        best_model_name = sorted_models[0]
+        best_result = results[best_model_name]
+
+    ModelClass = best_result['class']
+    final_model = ModelClass()
+    try:
+        final_model.fit(y_series, dates)
+    except:
+        final_model = ModelETS()
+        final_model.fit(y_series)
+        best_model_name = 'ETS (fallback-final)'
+
+    comparison = {
+        'modelo': best_model_name, 'wmape': best_result['wmape_mean'], 'wmape_std': best_result['wmape_std'],
+        'aicc': best_result['aicc_mean'], 'all_results': results, 'errors': errors_debug if DEBUG else {},
+        'rejected_flat': rejected_flat
+    }
+    return final_model, comparison
+
+
+# =============================================================================
+# PROCESSAMENTO DOS GRUPOS
+# =============================================================================
+
+def process_group(group_data, fornecedor, categoria):
+    group_data = group_data.sort_values('ano_mes').copy()
+    group_data['MÊS'] = group_data['ano_mes'].str[-2:].astype(int)
+
+    # % Promo Calculado sobre a Venda Regular (Pura)
+    group_data['Promoção Estimada'] = np.maximum(0, group_data['Soma de Qtd Bruta'] - group_data['Venda Regular'])
+    group_data['% PROMO'] = np.where(group_data['Soma de Qtd Bruta'] > 0,
+                                     group_data['Promoção Estimada'] / group_data['Soma de Qtd Bruta'], 0)
+
+    dates = pd.to_datetime(group_data['ano_mes'].str.replace('_', '-') + '-01')
+
+    # ⚠️ AQUI ESTÁ A GRANDE MUDANÇA: O motor agora aprende com a 'Venda Considerada'
+    y_series = group_data['Venda Considerada'].values
+
+    if len(y_series) < MIN_TRAIN_SIZE:
+        group_data['Data'] = dates
+        group_data['ano'] = group_data['ano_mes'].str[:4].astype(int)
+        group_data['Previsão'] = group_data['Venda Considerada']
+        group_data['Modelo_ETS'] = f'INSUF ({len(y_series)} meses)'
+        group_data['AICc'] = np.nan
+        group_data['wMAPE'] = np.nan
+        return group_data, None, {'modelo': f'INSUF ({len(y_series)} meses)', 'wmape': None, 'all_results': {}}
+
+    best_model, comparison = select_best_model(y_series, dates, f"{fornecedor}|{categoria}")
+
+    if best_model is None or 'FALHA' in comparison['modelo'] or 'ERRO' in comparison['modelo']:
+        group_data['Data'] = dates
+        group_data['ano'] = group_data['ano_mes'].str[:4].astype(int)
+        group_data['Previsão'] = group_data['Venda Considerada']
+        group_data['Modelo_ETS'] = comparison.get('modelo', 'FALHA')
+        group_data['AICc'] = np.nan
+        group_data['wMAPE'] = np.nan
+        return group_data, None, comparison
+
+    try:
+        forecast = np.maximum(best_model.predict(FORECAST_HORIZON), 0)
+    except Exception as e:
+        group_data['Data'] = dates
+        group_data['ano'] = group_data['ano_mes'].str[:4].astype(int)
+        group_data['Previsão'] = group_data['Venda Considerada']
+        group_data['Modelo_ETS'] = 'ERRO PRED'
+        group_data['AICc'] = np.nan
+        group_data['wMAPE'] = np.nan
+        return group_data, None, comparison
+
+    wmape_vencedor = comparison.get('wmape', np.nan)
+    future_dates = pd.date_range(start=dates.iloc[-1] + pd.DateOffset(months=1), periods=FORECAST_HORIZON, freq='MS')
+
+    nome_modelo = 'ETS (Forçado Sazonal)' if comparison.get(
+        'modelo') == 'ETS (Forçado Sazonal)' else best_model.get_info()
+
+    df_forecast = pd.DataFrame({
+        'fornecedor comercial': fornecedor, 'categoria': categoria,
+        'ano_mes': future_dates.strftime('%Y_%m'), 'Soma de Qtd Bruta': np.nan,
+        'Data': future_dates, 'MÊS': future_dates.month,
+        'Média Mês Normal': np.nan, 'Promoção Estimada': np.nan, '% PROMO': np.nan,
+        'Venda Regular': np.nan,
+        'Venda Considerada': forecast.round(0),
+        'Previsão': forecast.round(0),
+        'ano': future_dates.year,
+        'Modelo_ETS': nome_modelo,
+        'AICc': best_model.aicc if hasattr(best_model, 'aicc') and best_model.aicc < 1e6 else np.nan,
+        'wMAPE': wmape_vencedor
+    })
+
+    group_data['Data'] = dates
+    group_data['ano'] = group_data['ano_mes'].str[:4].astype(int)
+    group_data['Previsão'] = group_data['Venda Considerada']
+    group_data['Modelo_ETS'] = nome_modelo
+    group_data['AICc'] = best_model.aicc if hasattr(best_model, 'aicc') and best_model.aicc < 1e6 else np.nan
+    group_data['wMAPE'] = wmape_vencedor
+
+    return pd.concat([group_data, df_forecast], ignore_index=True), best_model, comparison
+
+
+def process_wrapper(args):
+    """Wrapper para facilitar a paralelização com Joblib e blindar contra falhas"""
+    try:
+        import warnings
+        import logging
+        import os
+
+        warnings.simplefilter("ignore")
+        os.environ["PYTHONWARNINGS"] = "ignore"
+        warnings.filterwarnings('ignore', category=UserWarning)
+        warnings.filterwarnings('ignore', message='.*convergence.*')
+        warnings.filterwarnings('ignore', message='.*Maximum Likelihood.*')
+
+        try:
+            from statsmodels.tools.sm_exceptions import ConvergenceWarning
+            warnings.filterwarnings('ignore', category=ConvergenceWarning)
+        except:
+            pass
+
+        for logger_name in ['cmdstanpy', 'prophet', 'statsmodels', 'pystan', 'stan', 'prophet.plot']:
+            _logger = logging.getLogger(logger_name)
+            _logger.setLevel(logging.CRITICAL)
+            _logger.propagate = False
+            if not _logger.handlers:
+                _logger.addHandler(logging.NullHandler())
+
+        (fornecedor, categoria), group_data = args
+        result, _, comparison = process_group(group_data, fornecedor, categoria)
+        return fornecedor, categoria, result, comparison
+
+    except Exception as e:
+        (fornecedor, categoria), group_data = args
+        return fornecedor, categoria, None, {'modelo': f'ERRO FATAL PARALELO: {str(e)}', 'wmape': None,
+                                             'all_results': {}}
+
+
+# =============================================================================
+# FLUXO PRINCIPAL
+# =============================================================================
+
+def main():
+    print("=" * 70)
+    print("ETAPA 1 - PREVISÃO POR CATEGORIA (MULTI-MODEL COMPETITION)")
+    print("⚠️  VERSÃO: VENDA CONSIDERADA (Regras via Parâmetros Nível 4)")
+    print("=" * 70)
+
+    inicio = datetime.now()
+
+    # 1. Carregar Dados com Auto-Fix
+    df, df_params = carregar_dados()
+
+    # 2. Preparar Dados Aplicando a Regra no Nível 4
+    df_agg = prepare_data(df, df_params)
+
+    grupos_list = [((f, c), group) for (f, c), group in df_agg.groupby(['fornecedor comercial', 'categoria'])]
+    total_grupos = len(grupos_list)
+
+    print(f"\n[2] Processando previsão para {total_grupos} categorias...")
+
+    if JOBLIB_AVAILABLE:
+        n_cores = max(1, multiprocessing.cpu_count() - 1)
+        print(f"    🚀 Iniciando processamento paralelo usando {n_cores} núcleos...")
+        parallel_results = Parallel(n_jobs=n_cores, verbose=10, backend="multiprocessing")(
+            delayed(process_wrapper)(args) for args in grupos_list
+        )
+    else:
+        print("    ⏳ Iniciando processamento sequencial...")
+        parallel_results = [process_wrapper(args) for args in grupos_list]
+
+    print("\n[3] Consolidando resultados...")
+    resultados = []
+    modelo_stats = {'ETS': 0, 'SARIMA': 0, 'Prophet': 0, 'Theta': 0, 'Fallback': 0, 'Insuficiente': 0,
+                    'Forçado Sazonal': 0, 'Erros Fatais': 0}
+
+    for fornecedor, categoria, result, comparison in parallel_results:
+        if result is not None:
+            resultados.append(result)
+            if comparison and comparison.get('modelo'):
+                mod = comparison['modelo']
+                if 'INSUF' in mod:
+                    modelo_stats['Insuficiente'] += 1
+                elif 'Forçado Sazonal' in mod:
+                    modelo_stats['Forçado Sazonal'] += 1
+                elif 'ETS' in mod:
+                    modelo_stats['ETS'] += 1
+                elif 'SARIMA' in mod:
+                    modelo_stats['SARIMA'] += 1
+                elif 'Prophet' in mod:
+                    modelo_stats['Prophet'] += 1
+                elif 'Theta' in mod:
+                    modelo_stats['Theta'] += 1
+                else:
+                    modelo_stats['Fallback'] += 1
+        else:
+            modelo_stats['Erros Fatais'] += 1
+
+    df_final = pd.concat(resultados, ignore_index=True)
+
+    # Adicionada a nova coluna "Venda Considerada" ao Output final
+    colunas_ordem = ['fornecedor comercial', 'categoria', 'ano_mes', 'Soma de Qtd Bruta', 'Data', 'MÊS',
+                     'Média Mês Normal', 'Promoção Estimada', '% PROMO', 'Venda Regular', 'Venda Considerada',
+                     'Previsão', 'ano', 'Modelo_ETS', 'AICc', 'wMAPE']
+    df_final = df_final[[col for col in colunas_ordem if col in df_final.columns]]
+
+    print(f"\n[4] Salvando {PATH_OUTPUT}...")
+    df_final.to_excel(PATH_OUTPUT, index=False)
+
+    duracao = (datetime.now() - inicio).total_seconds()
+
+    print("\n" + "=" * 70)
+    print("📊 ESTATÍSTICAS DE SELEÇÃO DE MODELO")
+    print("=" * 70)
+    for modelo, count in sorted(modelo_stats.items(), key=lambda x: -x[1]):
+        if count > 0:
+            print(f"    {modelo:<25} {count:>10,} {(count / max(sum(modelo_stats.values()), 1) * 100):>7.1f}%")
+
+    print(f"\n    Tempo de execução: {duracao / 60:.1f} minutos ({duracao:.0f} segundos)")
+    print("=" * 70)
+    print("✅ ETAPA 1 CONCLUÍDA COM SUCESSO!")
+
+    return df_final
+
+
+if __name__ == "__main__":
+    df_resultado = main()
