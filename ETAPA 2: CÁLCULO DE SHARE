@@ -1,0 +1,514 @@
+"""
+================================================================================
+ETAPA 2: CÁLCULO DE SHARE HÍBRIDO RENORMALIZADO POR SKU/CD/MÊS
+================================================================================
+
+VERSÃO: Arquivo Local (Excel)
+
+LÓGICA DO CÁLCULO:
+    - Share Sazonal = Venda (SKU/CD) ÷ Venda Total (Fornecedor/Categoria/Mês/Ano)
+                      Depois tira a média dos anos
+    - Share Recente = Venda (SKU/CD) ÷ Venda Total (Fornecedor/Categoria)
+                      Considerando os últimos 3 meses
+    - Share Híbrido = 70% Recente + 30% Sazonal
+    - Renormalização = Soma do Share por Fornecedor/Categoria/Mês = 100%
+
+COMO USAR:
+    1. Configure o caminho do arquivo na seção CONFIGURAÇÕES abaixo
+    2. Execute o script: python share_hibrido_local.py
+    3. O resultado será salvo na mesma pasta do arquivo de entrada
+
+================================================================================
+"""
+
+# ==============================================================================
+# IMPORTAÇÃO DAS BIBLIOTECAS
+# ==============================================================================
+
+import pandas as pd  # Manipulação de dados em DataFrames
+from datetime import datetime  # Manipulação de datas
+from dateutil.relativedelta import relativedelta  # Cálculo de diferença entre datas
+from openpyxl import Workbook  # Criação de arquivos Excel
+from openpyxl.styles import Font, PatternFill, Alignment  # Formatação do Excel
+import os  # Para manipulação de caminhos de arquivos
+
+# ==============================================================================
+# ⚙️ CONFIGURAÇÕES - ALTERE AQUI! ⚙️
+# ==============================================================================
+
+# Caminho do arquivo de entrada (sua base de vendas históricas)
+ARQUIVO_ENTRADA = r'\\files\Setores\SupplyChain\Forecast Fornecedores\2026\Teste Automatizado\ETAPA_0_HISTORICO.xlsx'
+
+# Nome do arquivo de saída (será salvo na mesma pasta do arquivo de entrada)
+ARQUIVO_SAIDA = 'ETAPA_2_SHARE_PRODUTO.xlsx'
+
+# Parâmetros do modelo híbrido
+PESO_RECENTE = 0.70  # Peso dado ao share dos últimos 3 meses (70%)
+PESO_SAZONAL = 0.30  # Peso dado ao share histórico sazonal (30%)
+
+
+# ==============================================================================
+# ETAPA 1: LEITURA DO ARQUIVO
+# ==============================================================================
+
+def ler_arquivo(caminho):
+    """
+    Lê o arquivo Excel de entrada.
+    """
+    print("=" * 60)
+    print("ETAPA 1: Lendo arquivo...")
+    print("=" * 60)
+
+    df = pd.read_excel(caminho)
+
+    print(f"✓ Arquivo lido: {caminho}")
+    print(f"  - Registros: {len(df):,}\n")
+
+    return df
+
+
+# ==============================================================================
+# ETAPA 2: PREPARAÇÃO DOS DADOS
+# ==============================================================================
+
+def preparar_dados(df):
+    """
+    Prepara e padroniza os dados para o cálculo.
+    """
+    print("=" * 60)
+    print("ETAPA 2: Preparando dados...")
+    print("=" * 60)
+
+    # Padroniza nomes das colunas (minúsculas, sem espaços extras)
+    df.columns = df.columns.str.strip().str.lower()
+
+    # Converte data para datetime
+    df['data'] = pd.to_datetime(df['data'])
+
+    # Padroniza situação para maiúsculas
+    df['situacao'] = df['situacao'].str.upper().str.strip()
+
+    # Converte A/D para ATIVO/INATIVO
+    df['situacao'] = df['situacao'].replace({'A': 'ATIVO', 'S': 'ATIVO', 'D': 'INATIVO'})
+
+    # Garante que quantidade é numérica
+    df['qtd bruta'] = pd.to_numeric(df['qtd bruta'], errors='coerce').fillna(0)
+
+    # Renomeia colunas para padrão interno
+    df = df.rename(columns={
+        'fornecedor comercial': 'fornecedor_comercial',
+        'nome nível 3': 'categoria',
+        'qtd bruta': 'qtd_bruta'
+    })
+
+    print(f"✓ Dados preparados!")
+    print(f"  - Fornecedores: {df['fornecedor_comercial'].nunique():,}")
+    print(f"  - Categorias: {df['categoria'].nunique():,}")
+    print(f"  - CDs: {df['codigo_deposito_pd'].nunique():,}")
+    print(f"  - SKUs ATIVOS: {df[df['situacao'] == 'ATIVO']['codigo_produto'].nunique():,}")
+    print(f"  - SKUs INATIVOS: {df[df['situacao'] == 'INATIVO']['codigo_produto'].nunique():,}\n")
+
+    return df
+
+
+# ==============================================================================
+# ETAPA 3: CÁLCULO DO SHARE SAZONAL
+# ==============================================================================
+
+def calcular_share_sazonal(df):
+    """
+    Calcula o share sazonal.
+
+    Fórmula:
+        Share Sazonal = Venda (SKU/CD) ÷ Venda Total (Fornecedor/Categoria/Mês/Ano)
+        Depois tira a média dos anos para cada Fornecedor/Categoria/Mês/CD/SKU
+    """
+    print("=" * 60)
+    print("ETAPA 3: Calculando Share Sazonal...")
+    print("  - Numerador: Venda (SKU/CD)")
+    print("  - Denominador: Venda Total (Fornecedor/Categoria/Mês/Ano)")
+    print("=" * 60)
+
+    # Vendas por SKU/CD em cada Fornecedor/Categoria/Mês/Ano (NUMERADOR)
+    vendas_sku_cd = df.groupby(
+        ['fornecedor_comercial', 'categoria', 'mes', 'ano', 'codigo_deposito_pd', 'codigo_produto']
+    )['qtd_bruta'].sum().reset_index()
+
+    # Total do grupo Fornecedor/Categoria/Mês/Ano (DENOMINADOR - sem CD e sem SKU)
+    total_grupo = df.groupby(
+        ['fornecedor_comercial', 'categoria', 'mes', 'ano']
+    )['qtd_bruta'].sum().reset_index()
+    total_grupo.columns = ['fornecedor_comercial', 'categoria', 'mes', 'ano', 'total_grupo']
+
+    # Junta numerador com denominador e calcula share
+    vendas_sku_cd = vendas_sku_cd.merge(
+        total_grupo,
+        on=['fornecedor_comercial', 'categoria', 'mes', 'ano']
+    )
+    vendas_sku_cd['share'] = (vendas_sku_cd['qtd_bruta'] / vendas_sku_cd['total_grupo']).fillna(0)
+
+    # Média do share por Fornecedor/Categoria/Mês/CD/SKU (média dos anos)
+    share_saz = vendas_sku_cd.groupby(
+        ['fornecedor_comercial', 'categoria', 'mes', 'codigo_deposito_pd', 'codigo_produto']
+    )['share'].mean().reset_index()
+    share_saz.columns = ['fornecedor', 'categoria', 'mes', 'cd', 'sku', 'share_sazonal']
+
+    print(f"✓ Share sazonal: {len(share_saz):,} combinações\n")
+
+    return share_saz
+
+
+# ==============================================================================
+# ETAPA 4: CÁLCULO DO SHARE RECENTE
+# ==============================================================================
+
+def calcular_share_recente(df):
+    """
+    Calcula o share recente (últimos 3 meses).
+
+    Fórmula:
+        Share Recente = Venda (SKU/CD) ÷ Venda Total (Fornecedor/Categoria)
+        Considerando apenas os últimos 3 meses de dados
+    """
+    print("=" * 60)
+    print("ETAPA 4: Calculando Share Recente (últimos 3 meses)...")
+    print("  - Numerador: Venda (SKU/CD)")
+    print("  - Denominador: Venda Total (Fornecedor/Categoria)")
+    print("=" * 60)
+
+    # Filtra últimos 3 meses
+    data_max = df['data'].max()
+    data_corte = data_max - relativedelta(months=2)
+    df_rec = df[df['data'] >= data_corte].copy()
+
+    print(f"  - Período: {data_corte.strftime('%Y-%m-%d')} a {data_max.strftime('%Y-%m-%d')}")
+
+    # Vendas por SKU/CD (NUMERADOR)
+    vendas_sku_cd = df_rec.groupby(
+        ['fornecedor_comercial', 'categoria', 'codigo_deposito_pd', 'codigo_produto']
+    )['qtd_bruta'].sum().reset_index()
+
+    # Total do grupo Fornecedor/Categoria (DENOMINADOR - sem CD e sem SKU)
+    total_grupo = df_rec.groupby(
+        ['fornecedor_comercial', 'categoria']
+    )['qtd_bruta'].sum().reset_index()
+    total_grupo.columns = ['fornecedor_comercial', 'categoria', 'total_grupo']
+
+    # Junta e calcula share
+    vendas_sku_cd = vendas_sku_cd.merge(
+        total_grupo,
+        on=['fornecedor_comercial', 'categoria']
+    )
+    vendas_sku_cd['share_recente'] = (vendas_sku_cd['qtd_bruta'] / vendas_sku_cd['total_grupo']).fillna(0)
+
+    share_rec = vendas_sku_cd[
+        ['fornecedor_comercial', 'categoria', 'codigo_deposito_pd', 'codigo_produto', 'share_recente']].copy()
+    share_rec.columns = ['fornecedor', 'categoria', 'cd', 'sku', 'share_recente']
+
+    print(f"✓ Share recente: {len(share_rec):,} combinações\n")
+
+    return share_rec
+
+
+# ==============================================================================
+# ETAPA 5: CÁLCULO DO SHARE HÍBRIDO
+# ==============================================================================
+
+def calcular_share_hibrido(share_saz, share_rec):
+    """
+    Combina share sazonal e recente com pesos configurados.
+
+    Fórmula:
+        Share Híbrido = (Peso_Recente × Share_Recente) + (Peso_Sazonal × Share_Sazonal)
+    """
+    print("=" * 60)
+    print("ETAPA 5: Calculando Share Híbrido...")
+    print("=" * 60)
+    print(f"  - Peso Recente: {PESO_RECENTE:.0%}")
+    print(f"  - Peso Sazonal: {PESO_SAZONAL:.0%}")
+
+    # Junta sazonal (tem mês) com recente (não tem mês - será replicado)
+    df_hib = share_saz.merge(
+        share_rec,
+        on=['fornecedor', 'categoria', 'cd', 'sku'],
+        how='left'
+    )
+
+    # Preenche valores nulos com 0
+    df_hib['share_recente'] = df_hib['share_recente'].fillna(0)
+    df_hib['share_sazonal'] = df_hib['share_sazonal'].fillna(0)
+
+    # Calcula share híbrido
+    df_hib['share_hibrido'] = (
+            PESO_RECENTE * df_hib['share_recente'] +
+            PESO_SAZONAL * df_hib['share_sazonal']
+    )
+
+    print(f"✓ Share híbrido: {len(df_hib):,} combinações\n")
+
+    return df_hib
+
+
+# ==============================================================================
+# ETAPA 6: FILTRAR APENAS ATIVOS
+# ==============================================================================
+
+def filtrar_ativos(df_hib, df_original):
+    """
+    Adiciona situação (ATIVO/INATIVO) e filtra apenas SKUs ativos.
+    A situação é por SKU + CD (não apenas por SKU).
+    """
+    print("=" * 60)
+    print("ETAPA 6: Filtrando apenas SKUs ATIVOS...")
+    print("=" * 60)
+
+    # Extrai situação única de cada SKU + CD (pega a mais recente)
+    situacao_sku_cd = df_original.sort_values('data').groupby(
+        ['codigo_deposito_pd', 'codigo_produto']
+    )['situacao'].last().reset_index()
+    situacao_sku_cd.columns = ['cd', 'sku', 'situacao']
+
+    # Adiciona situação ao dataframe
+    df_hib = df_hib.merge(situacao_sku_cd, on=['cd', 'sku'], how='left')
+
+    # Filtra apenas ativos
+    df_ativos = df_hib[df_hib['situacao'] == 'ATIVO'].copy()
+
+    print(f"✓ Filtrado: {len(df_ativos):,} combinações de SKUs ativos\n")
+
+    return df_ativos
+
+
+# ==============================================================================
+# ETAPA 7: RENORMALIZAÇÃO
+# ==============================================================================
+
+def renormalizar(df_ativos):
+    """
+    Renormaliza o share para garantir soma = 100% por grupo.
+
+    Grupo de renormalização: FORNECEDOR - CATEGORIA - MÊS
+
+    Fórmula:
+        Share_Final = Share_Híbrido / Soma(Share_Híbrido do grupo)
+    """
+    print("=" * 60)
+    print("ETAPA 7: Renormalizando (soma = 100% por FORNECEDOR/CATEGORIA/MÊS)...")
+    print("=" * 60)
+
+    # Soma do share híbrido por grupo (Fornecedor/Categoria/Mês)
+    soma_grupo = df_ativos.groupby(
+        ['fornecedor', 'categoria', 'mes']
+    )['share_hibrido'].sum().reset_index()
+    soma_grupo.columns = ['fornecedor', 'categoria', 'mes', 'soma_grupo']
+
+    # Adiciona soma do grupo e calcula share final
+    df_ativos = df_ativos.merge(soma_grupo, on=['fornecedor', 'categoria', 'mes'])
+    df_ativos['share_final'] = (df_ativos['share_hibrido'] / df_ativos['soma_grupo']).fillna(0)
+
+    # Validação: soma por Fornecedor/Categoria/Mês
+    validacao = df_ativos.groupby(['fornecedor', 'categoria', 'mes'])['share_final'].sum()
+    grupos_ok = ((validacao > 0.999) & (validacao < 1.001)).sum()
+
+    print(f"✓ Renormalizado!")
+    print(f"  - Grupos (Fornecedor/Categoria/Mês) com soma = 100%: {grupos_ok:,} de {len(validacao):,}\n")
+
+    return df_ativos
+
+
+# ==============================================================================
+# ETAPA 7.1: EXPANDIR SHARE PARA TODOS OS 12 MESES
+# ==============================================================================
+
+def expandir_share_12_meses(df_ativos):
+    """
+    Expande o share para todos os 12 meses.
+
+    Para combinações Fornecedor/Categoria/CD/SKU que não têm todos os 12 meses,
+    replica o share médio dos meses existentes para os meses faltantes.
+    """
+    print("=" * 60)
+    print("ETAPA 7.1: Expandindo share para todos os 12 meses...")
+    print("=" * 60)
+
+    # Identificar todos os meses que deveriam existir
+    todos_meses = list(range(1, 13))
+
+    # Agrupar por Fornecedor/Categoria/CD/SKU
+    grupos = df_ativos.groupby(['fornecedor', 'categoria', 'cd', 'sku'])
+
+    registros_expandidos = []
+
+    for (fornecedor, categoria, cd, sku), grupo in grupos:
+        meses_existentes = set(grupo['mes'].unique())
+        meses_faltantes = set(todos_meses) - meses_existentes
+
+        # Adicionar registros existentes
+        for _, row in grupo.iterrows():
+            registros_expandidos.append(row.to_dict())
+
+        # Se faltam meses, replicar com a média dos existentes
+        if meses_faltantes:
+            # Calcular média dos shares existentes
+            media_sazonal = grupo['share_sazonal'].mean()
+            media_recente = grupo['share_recente'].mean()
+            media_hibrido = grupo['share_hibrido'].mean()
+            situacao = grupo['situacao'].iloc[0]
+
+            for mes in meses_faltantes:
+                registros_expandidos.append({
+                    'fornecedor': fornecedor,
+                    'categoria': categoria,
+                    'mes': mes,
+                    'cd': cd,
+                    'sku': sku,
+                    'situacao': situacao,
+                    'share_sazonal': media_sazonal,
+                    'share_recente': media_recente,
+                    'share_hibrido': media_hibrido,
+                    'soma_grupo': 0,  # Será recalculado na renormalização
+                    'share_final': 0  # Será recalculado na renormalização
+                })
+
+    df_expandido = pd.DataFrame(registros_expandidos)
+
+    meses_adicionados = len(df_expandido) - len(df_ativos)
+    print(f"✓ Meses adicionados: {meses_adicionados:,}")
+    print(f"✓ Total de registros: {len(df_expandido):,}\n")
+
+    return df_expandido
+
+
+def renormalizar_final(df_expandido):
+    """
+    Renormaliza o share após a expansão para garantir soma = 100% por grupo.
+    """
+    print("=" * 60)
+    print("ETAPA 7.2: Renormalizando após expansão...")
+    print("=" * 60)
+
+    # Soma do share híbrido por grupo (Fornecedor/Categoria/Mês)
+    soma_grupo = df_expandido.groupby(
+        ['fornecedor', 'categoria', 'mes']
+    )['share_hibrido'].sum().reset_index()
+    soma_grupo.columns = ['fornecedor', 'categoria', 'mes', 'soma_grupo']
+
+    # Remove coluna antiga e adiciona nova
+    df_expandido = df_expandido.drop(columns=['soma_grupo', 'share_final'], errors='ignore')
+    df_expandido = df_expandido.merge(soma_grupo, on=['fornecedor', 'categoria', 'mes'])
+    df_expandido['share_final'] = (df_expandido['share_hibrido'] / df_expandido['soma_grupo']).fillna(0)
+
+    # Validação
+    validacao = df_expandido.groupby(['fornecedor', 'categoria', 'mes'])['share_final'].sum()
+    grupos_ok = ((validacao > 0.999) & (validacao < 1.001)).sum()
+
+    print(f"✓ Renormalizado!")
+    print(f"  - Grupos com soma = 100%: {grupos_ok:,} de {len(validacao):,}\n")
+
+    return df_expandido
+
+# ==============================================================================
+# ETAPA 8: EXPORTAR PARA EXCEL
+# ==============================================================================
+
+def exportar_excel(df_final, arquivo_saida):
+    """
+    Exporta resultado para Excel formatado.
+    """
+    print("=" * 60)
+    print("ETAPA 8: Exportando para Excel...")
+    print("=" * 60)
+
+    # Seleciona e ordena colunas
+    colunas = ['fornecedor', 'categoria', 'mes', 'cd', 'sku', 'situacao',
+               'share_sazonal', 'share_recente', 'share_hibrido',
+               'soma_grupo', 'share_final']
+    df_exp = df_final[colunas].sort_values(['fornecedor', 'categoria', 'mes', 'cd', 'sku'])
+
+    # Cria workbook
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Calculo_Hibrido"
+
+    # Estilos
+    header_fill = PatternFill('solid', fgColor='366092')
+    header_font = Font(bold=True, color='FFFFFF')
+
+    # Cabeçalhos
+    headers = ['Fornecedor', 'Categoria', 'Mes', 'CD', 'SKU', 'Situacao',
+               'Share_Sazonal', 'Share_Recente', 'Share_Hibrido',
+               'Soma_Grupo', 'Share_Final']
+
+    for col, header in enumerate(headers, 1):
+        cell = ws.cell(row=1, column=col, value=header)
+        cell.fill = header_fill
+        cell.font = header_font
+        cell.alignment = Alignment(horizontal='center')
+
+    # Dados
+    for row_idx, row in enumerate(df_exp.itertuples(index=False), 2):
+        for col_idx, value in enumerate(row, 1):
+            ws.cell(row=row_idx, column=col_idx, value=value)
+
+    # Formata percentuais (colunas 7 a 11)
+    for row in range(2, len(df_exp) + 2):
+        for col in range(7, 12):
+            ws.cell(row=row, column=col).number_format = '0.00%'
+
+    # Largura das colunas
+    for col, width in [('A', 18), ('B', 22), ('C', 8), ('D', 8), ('E', 12), ('F', 10),
+                       ('G', 14), ('H', 14), ('I', 14), ('J', 12), ('K', 12)]:
+        ws.column_dimensions[col].width = width
+
+    # Congela cabeçalho
+    ws.freeze_panes = 'A2'
+
+    # Salva
+    wb.save(arquivo_saida)
+
+    print(f"✓ Arquivo salvo: {arquivo_saida}")
+    print(f"  - Total de linhas: {len(df_exp):,}\n")
+
+
+# ==============================================================================
+# EXECUÇÃO PRINCIPAL
+# ==============================================================================
+
+if __name__ == "__main__":
+    print("\n" + "=" * 60)
+    print("   CÁLCULO DE SHARE HÍBRIDO RENORMALIZADO")
+    print("=" * 60 + "\n")
+
+    inicio = datetime.now()
+
+    # Define o caminho de saída na MESMA PASTA do arquivo de entrada
+    pasta_entrada = os.path.dirname(os.path.abspath(ARQUIVO_ENTRADA))
+    caminho_saida = os.path.join(pasta_entrada, ARQUIVO_SAIDA)
+
+    print(f"📂 Pasta de entrada: {pasta_entrada}")
+    print(f"📄 Arquivo de saída: {caminho_saida}\n")
+
+    # Executa todas as etapas
+    df = ler_arquivo(ARQUIVO_ENTRADA)
+    df = preparar_dados(df)
+    share_saz = calcular_share_sazonal(df)
+    share_rec = calcular_share_recente(df)
+    df_hib = calcular_share_hibrido(share_saz, share_rec)
+    df_ativos = filtrar_ativos(df_hib, df)
+    df_renorm = renormalizar(df_ativos)
+
+    # NOVO: Expandir para 12 meses e renormalizar novamente
+    df_expandido = expandir_share_12_meses(df_renorm)
+    df_final = renormalizar_final(df_expandido)
+
+    exportar_excel(df_final, caminho_saida)
+
+    # Finalização
+    duracao = (datetime.now() - inicio).total_seconds()
+
+    print("=" * 60)
+    print("✅ CONCLUÍDO!")
+    print("=" * 60)
+    print(f"  - Tempo: {duracao:.1f} segundos")
+    print(f"  - Arquivo gerado: {caminho_saida}")
+    print("\n")
