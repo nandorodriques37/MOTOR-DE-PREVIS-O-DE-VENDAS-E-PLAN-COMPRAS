@@ -30,6 +30,14 @@ from datetime import datetime, timedelta
 from dateutil.relativedelta import relativedelta
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+from openpyxl.utils import get_column_letter
+import time
+
+try:
+    from tqdm import tqdm
+except ImportError:
+    def tqdm(iterable, **kwargs):
+        return iterable
 
 # =============================================================================
 # CONFIGURAÇÕES - ALTERAR CONFORME NECESSÁRIO
@@ -96,7 +104,7 @@ def safe_numeric(val, default=0):
 def main():
     print("=" * 70)
     print("ETAPA 4 - CÁLCULO DE NECESSIDADE DE COMPRA (PEDIDO)")
-    print("⚠️ VERSÃO: FORWARD-LOOKING + CALENDÁRIO FIXO 1º DIA")
+    print("⚠️ VERSÃO: OTIMIZADA + DRP CONTÍNUO (MÊS A MÊS)")
     print("=" * 70)
 
     # -------------------------------------------------------------------------
@@ -104,8 +112,10 @@ def main():
     # -------------------------------------------------------------------------
     print("\n[1] Carregando arquivos...")
     try:
+        start_load = time.time()
         df_previsao = pd.read_excel(PATH_PREVISAO_SKU)
         df_estoque = pd.read_excel(PATH_ESTOQUE)
+        print(f"    ✓ Arquivos carregados em {time.time() - start_load:.2f} segundos.")
     except FileNotFoundError as e:
         print(f"\n❌ ERRO: Arquivo não encontrado!")
         print(f"   {e}")
@@ -118,7 +128,6 @@ def main():
     # 2. PREPARAR PARÂMETROS TEMPORAIS
     # -------------------------------------------------------------------------
     meses_horizonte = gerar_lista_meses(DATA_REFERENCIA, HORIZONTE_MESES)
-    # Extensão extra para o Forward-Looking (conseguir ler a demanda de meses à frente)
     meses_horizonte_ext = gerar_lista_meses(DATA_REFERENCIA, HORIZONTE_MESES + 6) 
 
     dias_restantes, dias_total = calcular_dias_restantes_mes(DATA_REFERENCIA)
@@ -168,12 +177,35 @@ def main():
         return
 
     # -------------------------------------------------------------------------
-    # 6. CALCULAR NECESSIDADE DE COMPRA
+    # 4. PRÉ-CÁLCULO E CACHE DE CALENDÁRIO OTIMIZADO
     # -------------------------------------------------------------------------
-    print("\n[4] Calculando necessidade de compra (Forward-Looking e Calendário Ajustado)...")
+    meses_ext_idx = {m: i for i, m in enumerate(meses_horizonte_ext)}
+    
+    # Pre-compute data de pedido simulada no horizonte
+    datas_pedido_por_t = []
+    for t in range(HORIZONTE_MESES):
+        if t == 0:
+            datas_pedido_por_t.append(DATA_REFERENCIA)
+        else:
+            datas_pedido_por_t.append((DATA_REFERENCIA + relativedelta(months=t)).replace(day=1))
+            
+    # Cache para `calcular_mes_chegada`
+    cache_chegada = {}
+    def fast_mes_chegada(data_pedido, lt_dias):
+        key = (data_pedido, lt_dias)
+        if key not in cache_chegada:
+             cache_chegada[key] = calcular_mes_chegada(data_pedido, lt_dias)
+        return cache_chegada[key]
+        
+    df_records = df.to_dict('records')
     linhas_output = []
 
-    for idx, row in df.iterrows():
+    # -------------------------------------------------------------------------
+    # 5. CALCULAR NECESSIDADE DE COMPRA (DRP CONTÍNUO E FORWARD-LOOKING)
+    # -------------------------------------------------------------------------
+    print("\n[4] Calculando simulação DRP Mês a Mês...")
+    
+    for row in tqdm(df_records, desc="Processando SKUs"):
         cadastro = {
             'fornecedor comercial': row.get('fornecedor comercial', ''),
             'situacao': row.get('situacao', ''), 'CHAVE': row['CHAVE'],
@@ -194,24 +226,21 @@ def main():
         estoque_inicial = estoque_atual + pendencia + nna
         dias_cobertura = lt + frequencia + est_seguranca
 
-        # 1. Calcular SELL_OUT e EST_OBJ (Forward-Looking)
-        est_obj_por_mes = {}
-        sell_out_por_mes = {}
+        # 1. Calcular SELL_OUT e EST_OBJ por índice via listas rápidas
+        est_obj_por_mes = [0.0] * len(meses_horizonte_ext)
+        sell_out_por_mes = [0.0] * len(meses_horizonte_ext)
 
-        for i, mes in enumerate(meses_horizonte):
-            # Sell Out
+        for i, mes in enumerate(meses_horizonte_ext):
             so = safe_numeric(row.get(mes, 0))
             if i == 0:
                 so = so * proporcao_mes_atual
-            sell_out_por_mes[mes] = so
+            sell_out_por_mes[i] = so
 
-            # Estoque Objetivo: Consumindo a demanda dos próximos X dias (Forward-Looking)
             dias_rest = dias_cobertura
-            demanda_forward = 0
+            demanda_forward = 0.0
             
             for j in range(i, len(meses_horizonte_ext)):
-                mes_futuro = meses_horizonte_ext[j]
-                demanda_futura = safe_numeric(row.get(mes_futuro, 0))
+                demanda_futura = safe_numeric(row.get(meses_horizonte_ext[j], 0))
                 
                 if dias_rest >= DIAS_MES:
                     demanda_forward += demanda_futura
@@ -221,84 +250,80 @@ def main():
                     dias_rest = 0
                     break
                     
-            # Se faltar horizonte na tabela, extrapola com o último mês conhecido
             if dias_rest > 0:
                 ultimo_mes_disp = meses_horizonte_ext[-1]
                 demanda_ult = safe_numeric(row.get(ultimo_mes_disp, 0))
                 demanda_forward += (demanda_ult / DIAS_MES) * dias_rest
                 
-            est_obj_por_mes[mes] = demanda_forward
+            est_obj_por_mes[i] = demanda_forward
 
-        # 2. Calcular mês de chegada corrigido (Mês atual = Hoje; Meses futuros = Dia 1º)
-        mes_chegada_por_mes_pedido = {}
-        for i, mes in enumerate(meses_horizonte):
-            if i == 0:
-                data_pedido = DATA_REFERENCIA 
+        # 2. Mapear o índice de chegada considerando o LT
+        idx_chegada_por_t = []
+        for t in range(HORIZONTE_MESES):
+            data_pedido = datas_pedido_por_t[t]
+            m_chegada = fast_mes_chegada(data_pedido, lt)
+            if m_chegada in meses_ext_idx:
+                idx_chegada_por_t.append(meses_ext_idx[m_chegada])
             else:
-                data_pedido = (DATA_REFERENCIA + relativedelta(months=i)).replace(day=1)
+                idx_chegada_por_t.append(len(meses_horizonte_ext) + 999)
+
+        # 3. Simulate MRP/DRP (Fluxo Linear)
+        pedidos = [0.0] * HORIZONTE_MESES
+        entradas = [0.0] * len(meses_horizonte_ext)
+        
+        for t in range(HORIZONTE_MESES):
+            idx_atual = idx_chegada_por_t[t]
+            
+            # Se a encomenda já passar do nosso horizonte estendido, ignora o cálculo
+            if idx_atual >= len(meses_horizonte_ext):
+                continue
                 
-            mes_chegada_por_mes_pedido[mes] = calcular_mes_chegada(data_pedido, lt)
+            idx_prox = idx_chegada_por_t[t+1] if t + 1 < HORIZONTE_MESES else idx_atual + 1
+            idx_fim = max(idx_atual, idx_prox - 1)
+            
+            necessidade_t = 0.0
+            
+            # Garanto os meses no alcance deste pedido
+            for k in range(idx_atual, idx_fim + 1):
+                if k >= len(meses_horizonte_ext):
+                    continue
+                    
+                # Estoque projetado acumulado até k 
+                proj_inv_k = estoque_inicial + sum(entradas[:k+1]) - sum(sell_out_por_mes[:k+1]) + necessidade_t
+                
+                obj_k = est_obj_por_mes[k]
+                if proj_inv_k < obj_k:
+                    req = obj_k - proj_inv_k
+                    necessidade_t += req
+                    
+            if necessidade_t > 0:
+                pedidos[t] += necessidade_t
+                entradas[idx_atual] += necessidade_t
 
-        # 3. Calcular Entradas e Pedidos Mês a Mês
-        pedidos = {mes: 0 for mes in meses_horizonte}
-        entradas = {mes: 0 for mes in meses_horizonte_ext}
-        estoque_anterior = estoque_inicial
-
-        for i, mes in enumerate(meses_horizonte):
-            sell_out = sell_out_por_mes[mes]
-            est_proj_sem_pedido = estoque_anterior + entradas.get(mes, 0) - sell_out
-            est_obj = est_obj_por_mes[mes]
-            mes_chegada = mes_chegada_por_mes_pedido[mes]
-
-            if est_proj_sem_pedido < est_obj:
-                necessidade_este_mes = est_obj - est_proj_sem_pedido
-                if mes_chegada == mes:
-                    pedidos[mes] = necessidade_este_mes
-                    entradas[mes] += necessidade_este_mes
-
-            if mes_chegada != mes and mes_chegada in est_obj_por_mes:
-                est_proj_chegada = est_proj_sem_pedido
-                if mes_chegada == mes:
-                    est_proj_chegada += pedidos.get(mes, 0)
-
-                for j in range(i + 1, len(meses_horizonte)):
-                    mes_j = meses_horizonte[j]
-                    if mes_j == mes_chegada:
-                        est_proj_chegada = est_proj_chegada + entradas.get(mes_chegada, 0) - sell_out_por_mes.get(mes_chegada, 0)
-                        break
-                    else:
-                        est_proj_chegada = est_proj_chegada + entradas.get(mes_j, 0) - sell_out_por_mes.get(mes_j, 0)
-
-                est_obj_chegada = est_obj_por_mes.get(mes_chegada, 0)
-                if est_proj_chegada < est_obj_chegada:
-                    necessidade_chegada = est_obj_chegada - est_proj_chegada
-                    pedidos[mes] = max(pedidos[mes], necessidade_chegada)
-                    entradas[mes_chegada] += necessidade_chegada
-
-            estoque_anterior = estoque_anterior + entradas.get(mes, 0) - sell_out
-
-        # 4. Consolidar Linhas de Resultado
-        estoque_anterior = estoque_inicial
-        for i, mes in enumerate(meses_horizonte):
-            sell_out = sell_out_por_mes[mes]
-            entrada_mes = entradas.get(mes, 0)
-            est_proj = estoque_anterior + entrada_mes - sell_out
+        # 4. Consolidar Resultados
+        estoque_atual_simul = estoque_inicial
+        for t in range(HORIZONTE_MESES):
+            mes = meses_horizonte[t]
+            sell_out = sell_out_por_mes[t]
+            entrada_mes = entradas[t]
+            est_proj = estoque_atual_simul + entrada_mes - sell_out
 
             linha = cadastro.copy()
             linha.update({
                 'MES_ANO': mes,
                 'SELL_OUT': round(sell_out, 0),
                 'ESTOQUE_PROJETADO': round(est_proj, 0),
-                'ESTOQUE_OBJETIVO': round(est_obj_por_mes[mes], 0),
-                'PEDIDO': round(pedidos[mes], 0),
+                'ESTOQUE_OBJETIVO': round(est_obj_por_mes[t], 0),
+                'PEDIDO': round(pedidos[t], 0),
                 'ENTRADA': round(entrada_mes, 0)
             })
             linhas_output.append(linha)
-            estoque_anterior = est_proj
+            estoque_atual_simul = est_proj
 
     # -------------------------------------------------------------------------
-    # 7. EXPORTAR PARA EXCEL
+    # 6. EXPORTAR PARA EXCEL OTIMIZADO
     # -------------------------------------------------------------------------
+    print("\n[5] Exportando para Excel...")
     df_output = pd.DataFrame(linhas_output)
     colunas_ordem = [
         'fornecedor comercial', 'situacao', 'CHAVE', 'codigo_deposito_pd',
@@ -308,37 +333,43 @@ def main():
     ]
     df_output = df_output[colunas_ordem]
 
-    print("\n[5] Exportando para Excel...")
-    wb = Workbook()
-    ws = wb.active
-    ws.title = "Necessidade_Compra"
+    start_export = time.time()
+    with pd.ExcelWriter(PATH_OUTPUT, engine='openpyxl') as writer:
+        df_output.to_excel(writer, sheet_name="Necessidade_Compra", index=False)
+        worksheet = writer.sheets["Necessidade_Compra"]
 
-    header_fill = PatternFill('solid', fgColor='366092')
-    header_font = Font(bold=True, color='FFFFFF')
-    border = Border(left=Side(style='thin'), right=Side(style='thin'), top=Side(style='thin'), bottom=Side(style='thin'))
+        # Formatações Visuais - Cabeçalho
+        header_fill = PatternFill('solid', fgColor='366092')
+        header_font = Font(bold=True, color='FFFFFF')
+        border = Border(left=Side(style='thin'), right=Side(style='thin'), top=Side(style='thin'), bottom=Side(style='thin'))
 
-    for col_idx, col_name in enumerate(df_output.columns, 1):
-        cell = ws.cell(row=1, column=col_idx, value=col_name)
-        cell.fill = header_fill
-        cell.font = header_font
-        cell.alignment = Alignment(horizontal='center')
-        cell.border = border
-
-    for row_idx, (_, row) in enumerate(df_output.iterrows(), 2):
-        for col_idx, col_name in enumerate(df_output.columns, 1):
-            cell = ws.cell(row=row_idx, column=col_idx, value=row[col_name])
+        for cell in worksheet[1]:
+            cell.fill = header_fill
+            cell.font = header_font
+            cell.alignment = Alignment(horizontal='center')
             cell.border = border
-            if col_name in ['SELL_OUT', 'ESTOQUE_PROJETADO', 'ESTOQUE_OBJETIVO', 'PEDIDO', 'ENTRADA', 'ESTOQUE', 'PENDENCIA', 'LT', 'NNA', 'FREQUENCIA', 'EST_SEGURANCA']:
-                cell.number_format = '#,##0'
 
-    for col, width in zip("ABCDEFGHIJKLMNOPQRST", [18, 8, 12, 6, 10, 35, 18, 20, 10, 10, 6, 6, 10, 10, 10, 12, 15, 15, 12, 12]):
-        ws.column_dimensions[col].width = width
+        # Define colunas numéricas
+        numeric_cols_idx = {i + 1 for i, col in enumerate(df_output.columns) 
+                            if col in ['SELL_OUT', 'ESTOQUE_PROJETADO', 'ESTOQUE_OBJETIVO', 'PEDIDO', 'ENTRADA', 'ESTOQUE', 'PENDENCIA', 'LT', 'NNA', 'FREQUENCIA', 'EST_SEGURANCA']}
 
-    ws.freeze_panes = 'A2'
-    ws.auto_filter.ref = ws.dimensions
-    wb.save(PATH_OUTPUT)
+        # Formatação rápida das células (muito mais veloz que iterar sobre linhas no pandas)
+        for row in worksheet.iter_rows(min_row=2, max_row=worksheet.max_row, min_col=1, max_col=worksheet.max_column):
+            for cell in row:
+                cell.border = border
+                if cell.column in numeric_cols_idx:
+                    cell.number_format = '#,##0'
 
-    print(f"    ✓ Arquivo salvo: {PATH_OUTPUT}")
+        # Ajuste de larguras
+        widths = [18, 8, 12, 6, 10, 35, 18, 20, 10, 10, 6, 6, 10, 10, 10, 12, 15, 15, 12, 12]
+        for col_idx, width in enumerate(widths, 1):
+            col_letter = get_column_letter(col_idx)
+            worksheet.column_dimensions[col_letter].width = width
+
+        worksheet.freeze_panes = 'A2'
+        worksheet.auto_filter.ref = worksheet.dimensions
+
+    print(f"    ✓ Arquivo salvo em {time.time() - start_export:.2f} segundos: {PATH_OUTPUT}")
     print("\n" + "=" * 70)
     print("✅ ETAPA 4 CONCLUÍDA COM SUCESSO!")
     print("=" * 70)
