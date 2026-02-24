@@ -41,6 +41,7 @@ import logging
 
 try:
     from dotenv import load_dotenv
+
     load_dotenv()
 except ImportError:
     pass
@@ -57,6 +58,7 @@ warnings.filterwarnings('ignore', message='.*Maximum Likelihood.*')
 
 try:
     from statsmodels.tools.sm_exceptions import ConvergenceWarning
+
     warnings.filterwarnings('ignore', category=ConvergenceWarning)
 except ImportError:
     pass
@@ -76,6 +78,7 @@ from typing import Tuple, List, Dict, Optional, Any
 
 try:
     from joblib import Parallel, delayed
+
     JOBLIB_AVAILABLE = True
 except ImportError:
     JOBLIB_AVAILABLE = False
@@ -86,24 +89,28 @@ from statsmodels.tsa.forecasting.theta import ThetaModel
 
 try:
     from prophet import Prophet
+
     PROPHET_AVAILABLE = True
 except ImportError:
     PROPHET_AVAILABLE = False
 
 try:
     import lightgbm as lgb
+
     LIGHTGBM_AVAILABLE = True
 except ImportError:
     LIGHTGBM_AVAILABLE = False
 
 try:
     import pandera as pa
+
     PANDERA_AVAILABLE = True
 except ImportError:
     PANDERA_AVAILABLE = False
 
 try:
     import optuna
+
     OPTUNA_AVAILABLE = True
 except ImportError:
     OPTUNA_AVAILABLE = False
@@ -127,15 +134,19 @@ for logger_name in ['cmdstanpy', 'prophet', 'statsmodels', 'pystan', 'stan', 'pr
     if not _logger.handlers:
         _logger.addHandler(logging.NullHandler())
 
+
 # =============================================================================
 # DATACLASS DE CONFIGURAÇÕES GLOBAIS
 # =============================================================================
 @dataclass
 class AppConfig:
-    path_input: str = os.getenv("PATH_INPUT", r"\\files\Setores\SupplyChain\Forecast Fornecedores\2026\Teste Automatizado\ETAPA_0_HISTORICO.xlsx")
-    path_parametros: str = os.getenv("PATH_PARAMETROS", r"\\files\Setores\SupplyChain\Forecast Fornecedores\2026\Teste Automatizado\FONTE_PARAMETROS.xlsx")
-    path_output: str = os.getenv("PATH_OUTPUT", r"\\files\Setores\SupplyChain\Forecast Fornecedores\2026\Teste Automatizado\ETAPA_1_PREVISAO_CATEGORIA.xlsx")
-    
+    path_input: str = os.getenv("PATH_INPUT",
+                                r"\\files\Setores\SupplyChain\Forecast Fornecedores\2026\Teste Automatizado\ETAPA_0_HISTORICO.xlsx")
+    path_parametros: str = os.getenv("PATH_PARAMETROS",
+                                     r"\\files\Setores\SupplyChain\Forecast Fornecedores\2026\Teste Automatizado\FONTE_PARAMETROS.xlsx")
+    path_output: str = os.getenv("PATH_OUTPUT",
+                                 r"\\files\Setores\SupplyChain\Forecast Fornecedores\2026\Teste Automatizado\ETAPA_1_PREVISAO_CATEGORIA.xlsx")
+
     forecast_horizon: int = int(os.getenv("FORECAST_HORIZON", 24))
     seasonal_period: int = int(os.getenv("SEASONAL_PERIOD", 12))
     n_rolling_windows: int = int(os.getenv("N_ROLLING_WINDOWS", 3))
@@ -144,7 +155,9 @@ class AppConfig:
     promo_tol: float = float(os.getenv("PROMO_TOL", 0.20))
     debug: bool = str(os.getenv("DEBUG", "False")).lower() == "true"
 
+
 CONFIG = AppConfig()
+
 
 # =============================================================================
 # INTERFACE BASE DOS MODELOS DE PREVISÃO
@@ -166,6 +179,7 @@ class BaseForecastModel(ABC):
     def get_info(self) -> str:
         pass
 
+
 # =============================================================================
 # MODELOS DE PREVISÃO IMPLEMENTADOS
 # =============================================================================
@@ -182,16 +196,16 @@ class ModelETS(BaseForecastModel):
         best_aicc = float('inf')
         best_model = None
         best_config = None
-        
+
         if OPTUNA_AVAILABLE and len(y_train) > 10:
             def objective(trial):
                 trend = trial.suggest_categorical('trend', [None, 'add'])
                 damped_trend = trial.suggest_categorical('damped_trend', [False, True]) if trend else False
-                
+
                 seasonal = None
                 if len(y_train) >= 2 * CONFIG.seasonal_period:
                     seasonal = trial.suggest_categorical('seasonal', [None, 'add', 'mul'])
-                
+
                 seasonal_periods = CONFIG.seasonal_period if seasonal else None
                 try:
                     model = ExponentialSmoothing(
@@ -208,7 +222,7 @@ class ModelETS(BaseForecastModel):
 
             study = optuna.create_study(direction='minimize')
             study.optimize(objective, n_trials=5)
-            
+
             best_params = study.best_params
             best_config = {
                 'trend': best_params.get('trend', None),
@@ -239,7 +253,7 @@ class ModelETS(BaseForecastModel):
                     {'trend': 'add', 'seasonal': 'mul', 'damped_trend': False},
                     {'trend': 'add', 'seasonal': 'mul', 'damped_trend': True},
                 ])
-                
+
             for config in configs:
                 try:
                     seasonal = config['seasonal']
@@ -256,10 +270,10 @@ class ModelETS(BaseForecastModel):
                         best_config = config
                 except Exception:
                     continue
-                
+
         if best_model is None:
             raise ValueError("Nenhuma configuração ETS convergiu")
-            
+
         self.fitted = best_model
         self.aicc = best_aicc
         self.best_config = best_config
@@ -296,14 +310,14 @@ class ModelSARIMA(BaseForecastModel):
         best_model = None
         best_order = None
         best_seasonal = None
-        
+
         if OPTUNA_AVAILABLE and len(y_train) >= 15:
             def objective(trial):
                 p = trial.suggest_int('p', 0, 2)
                 d = trial.suggest_int('d', 0, 1)
                 q = trial.suggest_int('q', 0, 2)
                 order = (p, d, q)
-                
+
                 if len(y_train) >= 2 * CONFIG.seasonal_period:
                     P = trial.suggest_int('P', 0, 1)
                     D = trial.suggest_int('D', 0, 1)
@@ -311,7 +325,7 @@ class ModelSARIMA(BaseForecastModel):
                     seasonal = (P, D, Q, CONFIG.seasonal_period)
                 else:
                     seasonal = (0, 0, 0, 0)
-                
+
                 try:
                     model = SARIMAX(y_train, order=order, seasonal_order=seasonal, enforce_stationarity=False,
                                     enforce_invertibility=False)
@@ -322,16 +336,17 @@ class ModelSARIMA(BaseForecastModel):
                     return aic + (2 * k * (k + 1)) / max(n - k - 1, 1)
                 except Exception:
                     return 1e6
-            
+
             study = optuna.create_study(direction='minimize')
             study.optimize(objective, n_trials=5)
             best_params = study.best_params
             best_order = (best_params.get('p', 1), best_params.get('d', 1), best_params.get('q', 1))
             if len(y_train) >= 2 * CONFIG.seasonal_period:
-                best_seasonal = (best_params.get('P', 0), best_params.get('D', 0), best_params.get('Q', 0), CONFIG.seasonal_period)
+                best_seasonal = (best_params.get('P', 0), best_params.get('D', 0), best_params.get('Q', 0),
+                                 CONFIG.seasonal_period)
             else:
                 best_seasonal = (0, 0, 0, 0)
-                
+
             try:
                 model = SARIMAX(y_train, order=best_order, seasonal_order=best_seasonal, enforce_stationarity=False,
                                 enforce_invertibility=False)
@@ -345,7 +360,7 @@ class ModelSARIMA(BaseForecastModel):
             orders = [(1, 1, 1), (0, 1, 1), (1, 1, 0), (1, 0, 1), (0, 1, 2)]
             seasonal_orders = [(1, 1, 1, CONFIG.seasonal_period), (0, 1, 1, CONFIG.seasonal_period)] if len(
                 y_train) >= 2 * CONFIG.seasonal_period else [(0, 0, 0, 0)]
-                
+
             for order in orders:
                 for seasonal in seasonal_orders:
                     try:
@@ -363,10 +378,10 @@ class ModelSARIMA(BaseForecastModel):
                             best_seasonal = seasonal
                     except Exception:
                         continue
-                    
+
         if best_model is None:
             raise ValueError("Nenhuma configuração SARIMA convergiu")
-            
+
         self.fitted = best_model
         self.aicc = best_aicc
         self.best_order = best_order
@@ -397,16 +412,16 @@ class ModelProphet(BaseForecastModel):
         y_train = np.array(y_train).flatten()
         if len(y_train) < 2:
             raise ValueError("Dados insuficientes para Prophet")
-            
+
         if dates is None:
             dates = pd.date_range(end=datetime.now(), periods=len(y_train), freq='MS')
-            
+
         self.train_dates = dates
         df = pd.DataFrame({'ds': pd.to_datetime(dates), 'y': y_train.astype(float)})
-        
+
         if df['y'].isna().all() or (df['y'] == 0).all():
             raise ValueError("Dados inválidos para Prophet (todos nulos ou zeros)")
-            
+
         # O logger já foi silenciado no header global
         last_error = None
         for attempt in range(2):
@@ -420,19 +435,20 @@ class ModelProphet(BaseForecastModel):
             except Exception as e:
                 last_error = e
                 continue
-                
+
         if last_error is not None:
             raise last_error
-            
+
         try:
             fitted_df = self.model.predict(df)
             residuals = df['y'].values - fitted_df['yhat'].values
             n, k = len(y_train), 5
             rss = np.sum(residuals ** 2)
-            self.aicc = n * np.log(rss / n) + 2 * k + (2 * k * (k + 1)) / max(n - k - 1, 1) if rss > 0 and n > k + 1 else 1e6
+            self.aicc = n * np.log(rss / n) + 2 * k + (2 * k * (k + 1)) / max(n - k - 1,
+                                                                              1) if rss > 0 and n > k + 1 else 1e6
         except Exception:
             self.aicc = 1e6
-            
+
         return self
 
     def predict(self, horizon: int) -> np.ndarray:
@@ -460,14 +476,14 @@ class ModelTheta(BaseForecastModel):
         period = CONFIG.seasonal_period if len(y_train) >= 2 * CONFIG.seasonal_period else None
         self.model = ThetaModel(pd.Series(y_train), period=period)
         self.fitted = self.model.fit()
-        
+
         if hasattr(self.fitted, 'fittedvalues'):
             residuals = y_train - self.fitted.fittedvalues.values
             n, k = len(y_train), 2
             rss = np.sum(residuals ** 2)
             if rss > 0 and n > k + 1:
                 self.aicc = n * np.log(rss / n) + 2 * k + (2 * k * (k + 1)) / max(n - k - 1, 1)
-                
+
         return self
 
     def predict(self, horizon: int) -> np.ndarray:
@@ -484,30 +500,32 @@ class ModelLightGBM(BaseForecastModel):
         self.name = "LightGBM"
         self.model = None
         self.aicc = float('inf')
-        self.lags = [1, 2, 3, 6, 12] 
+        self.lags = [1, 2, 3, 6, 12]
         self.history = []
         self.last_date = None
 
-    def _create_features(self, y_series: np.ndarray, dates: Optional[pd.DatetimeIndex] = None) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
+    def _create_features(self, y_series: np.ndarray, dates: Optional[pd.DatetimeIndex] = None) -> Tuple[
+        Optional[np.ndarray], Optional[np.ndarray]]:
         df = pd.DataFrame({'y': y_series})
         if dates is not None and len(dates) == len(y_series):
             df['month'] = dates.month
         else:
             df['month'] = 1
-            
+
         for lag in self.lags:
             df[f'lag_{lag}'] = df['y'].shift(lag)
-            
+
         df['rolling_mean_3'] = df['y'].shift(1).rolling(window=3).mean()
         df['rolling_mean_6'] = df['y'].shift(1).rolling(window=6).mean()
         df['rolling_max_3'] = df['y'].shift(1).rolling(window=3).max()
         df['rolling_min_3'] = df['y'].shift(1).rolling(window=3).min()
-        
+
         df = df.dropna()
         if len(df) == 0:
             return None, None
-            
-        feat_cols = [f'lag_{lag}' for lag in self.lags] + ['month', 'rolling_mean_3', 'rolling_mean_6', 'rolling_max_3', 'rolling_min_3']
+
+        feat_cols = [f'lag_{lag}' for lag in self.lags] + ['month', 'rolling_mean_3', 'rolling_mean_6', 'rolling_max_3',
+                                                           'rolling_min_3']
         X = df[feat_cols].values
         y = df['y'].values
         return X, y
@@ -515,11 +533,11 @@ class ModelLightGBM(BaseForecastModel):
     def fit(self, y_train: np.ndarray, dates: Optional[pd.DatetimeIndex] = None) -> 'ModelLightGBM':
         if not LIGHTGBM_AVAILABLE:
             raise ValueError("LightGBM não está instalado")
-            
+
         y_train = np.array(y_train).flatten()
         if len(y_train) <= max(self.lags) + 2:
             raise ValueError("Dados insuficientes para LightGBM criar features com Lags")
-            
+
         X_train, Y_train = self._create_features(y_train, dates)
         if X_train is None or len(X_train) == 0:
             raise ValueError("Não foi possível gerar features")
@@ -536,7 +554,7 @@ class ModelLightGBM(BaseForecastModel):
             'min_child_samples': 2,
             'random_state': 42
         }
-        
+
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
             try:
@@ -551,8 +569,8 @@ class ModelLightGBM(BaseForecastModel):
         residuals = Y_train - y_pred_train
         rss = np.sum(residuals ** 2)
         n = len(Y_train)
-        k = len(self.lags) + 1 
-        
+        k = len(self.lags) + 1
+
         if rss > 0 and n > k + 1:
             self.aicc = n * np.log(rss / n) + 2 * k + (2 * k * (k + 1)) / max(n - k - 1, 1)
         else:
@@ -568,37 +586,37 @@ class ModelLightGBM(BaseForecastModel):
     def predict(self, horizon: int) -> np.ndarray:
         if self.model is None:
             raise ValueError("Modelo LightGBM não treinado")
-            
+
         forecast = []
         current_history = list(self.history)
-        
+
         if self.last_date is None:
             current_date = pd.to_datetime('2026-01-01')
         else:
             current_date = self.last_date
-            
+
         for _ in range(horizon):
             current_date = current_date + pd.DateOffset(months=1)
             features = []
-            
+
             month = current_date.month
-            
+
             for lag in self.lags:
                 idx = len(current_history) - lag
                 features.append(current_history[idx] if idx >= 0 else current_history[0])
-                
+
             features.append(month)
             features.append(np.mean(current_history[-3:]) if len(current_history) >= 3 else current_history[-1])
             features.append(np.mean(current_history[-6:]) if len(current_history) >= 6 else current_history[-1])
             features.append(np.max(current_history[-3:]) if len(current_history) >= 3 else current_history[-1])
             features.append(np.min(current_history[-3:]) if len(current_history) >= 3 else current_history[-1])
-            
+
             X_curr = np.array([features])
             next_pred = self.model.predict(X_curr)[0]
             next_pred = max(0, next_pred)
             forecast.append(next_pred)
             current_history.append(next_pred)
-            
+
         return np.array(forecast)
 
     def get_info(self) -> str:
@@ -611,13 +629,13 @@ class ModelEnsemble(BaseForecastModel):
         self.model1 = model1
         self.model2 = model2
         self.aicc = float('inf')
-        
+
         e1 = max(err1, 0.0001)
         e2 = max(err2, 0.0001)
-        
+
         if np.isinf(e1) or np.isnan(e1): e1 = 1e6
         if np.isinf(e2) or np.isnan(e2): e2 = 1e6
-        
+
         peso1 = 1.0 / e1
         peso2 = 1.0 / e2
         self.w1 = peso1 / (peso1 + peso2)
@@ -649,11 +667,11 @@ class ModelSBA(BaseForecastModel):
     def fit(self, y_train: np.ndarray, dates: Optional[pd.DatetimeIndex] = None) -> 'ModelSBA':
         y_train = np.array(y_train).flatten()
         non_zero_idx = np.where(y_train > 0)[0]
-        
+
         if len(non_zero_idx) == 0:
             self.forecast_val = 0.0
             return self
-            
+
         z = y_train[non_zero_idx]
         if len(non_zero_idx) > 1:
             p = np.diff(non_zero_idx)
@@ -671,7 +689,7 @@ class ModelSBA(BaseForecastModel):
             self.aicc = n * np.log(rss / n) + 2 * k + (2 * k * (k + 1)) / max(n - k - 1, 1)
         else:
             self.aicc = 1e6
-            
+
         return self
 
     def predict(self, horizon: int) -> np.ndarray:
@@ -695,65 +713,72 @@ class GlobalLightGBMWrapper:
         forecast = []
         current_history = list(y_history)
         current_date = pd.to_datetime(dates.max()) if len(dates) > 0 else pd.to_datetime('2026-01-01')
-        
+
         for _ in range(horizon):
             current_date = current_date + pd.DateOffset(months=1)
             features = [current_date.month]
-            
+
             for lag in self.lags:
                 idx = len(current_history) - lag
-                val = current_history[idx] if idx >= 0 else (np.mean(current_history) if len(current_history) > 0 else 0)
+                val = current_history[idx] if idx >= 0 else (
+                    np.mean(current_history) if len(current_history) > 0 else 0)
                 features.append(val)
-                
+
             val_roll3 = int(np.clip(len(current_history), 1, 3))
             val_roll6 = int(np.clip(len(current_history), 1, 6))
-            
+
             features.append(np.mean(current_history[-val_roll3:]) if len(current_history) > 0 else 0)
             features.append(np.mean(current_history[-val_roll6:]) if len(current_history) > 0 else 0)
             features.append(np.max(current_history[-val_roll3:]) if len(current_history) > 0 else 0)
             features.append(np.min(current_history[-val_roll3:]) if len(current_history) > 0 else 0)
-            
+
             X_curr = np.array([features])
             next_pred = self.model.predict(X_curr)[0]
             next_pred = max(0, next_pred)
             forecast.append(next_pred)
             current_history.append(next_pred)
-            
+
         return np.array(forecast)
 
     def get_info(self) -> str:
         return "LightGBM (Modelo Global)"
 
+
 def train_global_model(df_agg: pd.DataFrame) -> Optional[GlobalLightGBMWrapper]:
     if not LIGHTGBM_AVAILABLE:
         return None
-        
+
     logger.info("    -> Treinando Modelo Global Cross-Learning (Cold-Start)...")
     df = df_agg.copy()
     if 'data' not in df.columns:
         df['data'] = pd.to_datetime(df['ano_mes'].str.replace('_', '-') + '-01')
     df = df.sort_values(['fornecedor comercial', 'categoria', 'data'])
-    
+
     lags = [1, 2, 3, 6, 12]
     for lag in lags:
         df[f'lag_{lag}'] = df.groupby(['fornecedor comercial', 'categoria'])['Venda Considerada'].shift(lag)
-        
-    df['rolling_mean_3'] = df.groupby(['fornecedor comercial', 'categoria'])['Venda Considerada'].shift(1).rolling(window=3, min_periods=1).mean()
-    df['rolling_mean_6'] = df.groupby(['fornecedor comercial', 'categoria'])['Venda Considerada'].shift(1).rolling(window=6, min_periods=1).mean()
-    df['rolling_max_3'] = df.groupby(['fornecedor comercial', 'categoria'])['Venda Considerada'].shift(1).rolling(window=3, min_periods=1).max()
-    df['rolling_min_3'] = df.groupby(['fornecedor comercial', 'categoria'])['Venda Considerada'].shift(1).rolling(window=3, min_periods=1).min()
-    
+
+    df['rolling_mean_3'] = df.groupby(['fornecedor comercial', 'categoria'])['Venda Considerada'].shift(1).rolling(
+        window=3, min_periods=1).mean()
+    df['rolling_mean_6'] = df.groupby(['fornecedor comercial', 'categoria'])['Venda Considerada'].shift(1).rolling(
+        window=6, min_periods=1).mean()
+    df['rolling_max_3'] = df.groupby(['fornecedor comercial', 'categoria'])['Venda Considerada'].shift(1).rolling(
+        window=3, min_periods=1).max()
+    df['rolling_min_3'] = df.groupby(['fornecedor comercial', 'categoria'])['Venda Considerada'].shift(1).rolling(
+        window=3, min_periods=1).min()
+
     df['month'] = df['data'].dt.month
-    
-    features = ['month'] + [f'lag_{lag}' for lag in lags] + ['rolling_mean_3', 'rolling_mean_6', 'rolling_max_3', 'rolling_min_3']
-    
+
+    features = ['month'] + [f'lag_{lag}' for lag in lags] + ['rolling_mean_3', 'rolling_mean_6', 'rolling_max_3',
+                                                             'rolling_min_3']
+
     df_train = df.dropna(subset=['Venda Considerada'])
     if len(df_train) == 0:
         return None
-        
+
     X = df_train[features].fillna(0)
     y = df_train['Venda Considerada']
-    
+
     if len(X) < 50:
         return None
 
@@ -763,7 +788,7 @@ def train_global_model(df_agg: pd.DataFrame) -> Optional[GlobalLightGBMWrapper]:
         'num_leaves': 31, 'learning_rate': 0.05, 'n_estimators': 150,
         'random_state': 42
     }
-    
+
     try:
         model = lgb.LGBMRegressor(**params)
         model.fit(X, y)
@@ -870,12 +895,14 @@ def prepare_data(df: pd.DataFrame, df_params: pd.DataFrame) -> pd.DataFrame:
     }).reset_index()
 
     df_n4['MÊS'] = df_n4['ano_mes'].str[-2:].astype(int)
-    
+
     # Tratamento Avançado de Anomalias com MAD (Median Absolute Deviation)
-    median = df_n4.groupby(['fornecedor comercial', 'nome nível 3', 'nome nível 4', 'MÊS'])['Qtd Bruta'].transform('median')
-    mad = df_n4.groupby(['fornecedor comercial', 'nome nível 3', 'nome nível 4', 'MÊS'])['Qtd Bruta'].transform(lambda x: np.median(np.abs(x - x.median())))
+    median = df_n4.groupby(['fornecedor comercial', 'nome nível 3', 'nome nível 4', 'MÊS'])['Qtd Bruta'].transform(
+        'median')
+    mad = df_n4.groupby(['fornecedor comercial', 'nome nível 3', 'nome nível 4', 'MÊS'])['Qtd Bruta'].transform(
+        lambda x: np.median(np.abs(x - x.median())))
     mad = np.where(mad == 0, median * 0.1, mad)  # Mínimo de 10% de variação se os dados forem constantes
-    
+
     df_n4['baseline'] = median
     limite_superior = np.maximum(median * (1 + CONFIG.promo_tol), median + 3 * mad)
     df_n4['Venda Regular'] = np.minimum(df_n4['Qtd Bruta'], limite_superior)
@@ -907,19 +934,21 @@ def prepare_data(df: pd.DataFrame, df_params: pd.DataFrame) -> pd.DataFrame:
         'baseline': 'Média Mês Normal'
     })
 
-    logger.info(f"    - Combinações consolidadas no Nível 3: {df_agg.groupby(['fornecedor comercial', 'categoria']).ngroups:,}")
+    logger.info(
+        f"    - Combinações consolidadas no Nível 3: {df_agg.groupby(['fornecedor comercial', 'categoria']).ngroups:,}")
     return df_agg
 
 
 # =============================================================================
 # FUNÇÕES DE AVALIAÇÃO DE MODELO (Refatoradas para Clean Code)
 # =============================================================================
-def _rolling_window_validation(y_series: np.ndarray, dates: pd.DatetimeIndex) -> List[Tuple[np.ndarray, np.ndarray, pd.DatetimeIndex, pd.DatetimeIndex]]:
+def _rolling_window_validation(y_series: np.ndarray, dates: pd.DatetimeIndex) -> List[
+    Tuple[np.ndarray, np.ndarray, pd.DatetimeIndex, pd.DatetimeIndex]]:
     """Gera janelas de treino e validação"""
     n = len(y_series)
     windows = []
     val_size = CONFIG.validation_size
-    
+
     for i in range(CONFIG.n_rolling_windows):
         val_end = n - i * val_size
         val_start = val_end - val_size
@@ -929,11 +958,12 @@ def _rolling_window_validation(y_series: np.ndarray, dates: pd.DatetimeIndex) ->
         windows.append((y_series[:train_end], y_series[val_start:val_end], dates[:train_end], dates[val_start:val_end]))
     return windows
 
+
 def _evaluate_model_cv(ModelClass: Any, windows: List[Tuple], errors_list: List[str]) -> Optional[Dict[str, Any]]:
     """Avalia um modelo específico nas janelas de validação (Cross-Validation)."""
     wmapes = []
     aiccs = []
-    
+
     for w_idx, (y_train, y_val, dates_train, dates_val) in enumerate(windows):
         try:
             model = ModelClass()
@@ -946,7 +976,7 @@ def _evaluate_model_cv(ModelClass: Any, windows: List[Tuple], errors_list: List[
         except Exception as e:
             errors_list.append(f"Janela {w_idx + 1}: {str(e)[:100]}")
             continue
-            
+
     if len(wmapes) > 0:
         return {
             'wmape_mean': np.mean(wmapes),
@@ -957,11 +987,12 @@ def _evaluate_model_cv(ModelClass: Any, windows: List[Tuple], errors_list: List[
         }
     return None
 
+
 def _is_forecast_flat(y_series: np.ndarray, forecast: np.ndarray) -> Tuple[bool, float]:
     """Verifica se a previsão gerada é 'chapada' (reta)."""
     cv_hist = np.std(y_series) / np.mean(y_series) if np.mean(y_series) > 0 else 0
     media_prev = np.mean(forecast)
-    
+
     if media_prev > 0:
         diffs = np.diff(forecast)
         variacao_ondas = np.std(diffs) / media_prev
@@ -969,12 +1000,14 @@ def _is_forecast_flat(y_series: np.ndarray, forecast: np.ndarray) -> Tuple[bool,
     else:
         is_flat = True
         variacao_ondas = 0.0
-        
+
     # Se a história tiver variabilidade (>10%) mas predição for reta, reprovamos
     rejeitado = is_flat and cv_hist > 0.10
     return rejeitado, variacao_ondas
 
-def select_best_model(y_series: np.ndarray, dates: pd.DatetimeIndex, debug_info: str = None) -> Tuple[Optional[BaseForecastModel], Dict[str, Any]]:
+
+def select_best_model(y_series: np.ndarray, dates: pd.DatetimeIndex, debug_info: str = None) -> Tuple[
+    Optional[BaseForecastModel], Dict[str, Any]]:
     y_series = np.array(y_series).flatten()
     windows = _rolling_window_validation(y_series, dates)
 
@@ -1004,15 +1037,16 @@ def select_best_model(y_series: np.ndarray, dates: pd.DatetimeIndex, debug_info:
         try:
             model = ModelETS()
             model.fit(y_series)
-            return model, {'modelo': 'ETS (fallback-erro)', 'wmape': None, 'aicc': model.aicc, 'all_results': {}, 'errors': errors_debug}
+            return model, {'modelo': 'ETS (fallback-erro)', 'wmape': None, 'aicc': model.aicc, 'all_results': {},
+                           'errors': errors_debug}
         except:
             return None, {'modelo': 'FALHA', 'wmape': None, 'aicc': None, 'all_results': {}, 'errors': errors_debug}
 
     sorted_models = sorted(results.keys(), key=lambda x: (results[x]['wmape_mean'], results[x]['aicc_mean']))
-    
+
     valid_models = []
     rejected_flat = []
-    
+
     for candidate_name in sorted_models:
         candidate_result = results[candidate_name]
         CandidateClass = candidate_result['class']
@@ -1024,9 +1058,10 @@ def select_best_model(y_series: np.ndarray, dates: pd.DatetimeIndex, debug_info:
             continue
 
         rejeitado, var_ondas = _is_forecast_flat(y_series, candidate_forecast)
-        
+
         if rejeitado:
-            rejected_flat.append(f"{candidate_name} (Sem onda: var {var_ondas:.4f}, wMAPE {candidate_result['wmape_mean']:.1f}%)")
+            rejected_flat.append(
+                f"{candidate_name} (Sem onda: var {var_ondas:.4f}, wMAPE {candidate_result['wmape_mean']:.1f}%)")
             continue
 
         valid_models.append((candidate_name, candidate_result))
@@ -1043,11 +1078,12 @@ def select_best_model(y_series: np.ndarray, dates: pd.DatetimeIndex, debug_info:
                 return forced_model, {
                     'modelo': 'ETS (Forçado Sazonal)', 'wmape': results[sorted_models[0]]['wmape_mean'], 'wmape_std': 0,
                     'aicc': forced_model.fitted.aicc if hasattr(forced_model.fitted, 'aicc') else 0,
-                    'all_results': results, 'errors': errors_debug if CONFIG.debug else {}, 'rejected_flat': rejected_flat
+                    'all_results': results, 'errors': errors_debug if CONFIG.debug else {},
+                    'rejected_flat': rejected_flat
                 }
             except Exception:
                 pass
-        
+
         best_model_name = sorted_models[0]
         best_result = results[best_model_name]
         ModelClass = best_result['class']
@@ -1087,26 +1123,26 @@ def select_best_model(y_series: np.ndarray, dates: pd.DatetimeIndex, debug_info:
     # ENSEMBLE DOS DOIS MELHORES MODELOS VÁLIDOS
     name1, res1 = valid_models[0]
     name2, res2 = valid_models[1]
-    
+
     model1 = res1['class']()
     model2 = res2['class']()
-    
+
     try:
         err1 = res1.get('wmape_mean', 1.0)
         err2 = res2.get('wmape_mean', 1.0)
         ensemble_model = ModelEnsemble(model1, model2, err1, err2)
         ensemble_model.fit(y_series, dates)
-        
+
         avg_wmape = ensemble_model.w1 * err1 + ensemble_model.w2 * err2
         avg_aicc = ensemble_model.w1 * res1['aicc_mean'] + ensemble_model.w2 * res2['aicc_mean']
-        
+
         comparison = {
             'modelo': f"EnsembleW({name1}+{name2})", 'wmape': avg_wmape, 'wmape_std': 0,
             'aicc': avg_aicc, 'all_results': results, 'errors': errors_debug if CONFIG.debug else {},
             'rejected_flat': rejected_flat
         }
         return ensemble_model, comparison
-        
+
     except Exception:
         best_model_name, best_result = valid_models[0]
         ModelClass = best_result['class']
@@ -1123,7 +1159,8 @@ def select_best_model(y_series: np.ndarray, dates: pd.DatetimeIndex, debug_info:
 # =============================================================================
 # PROCESSAMENTO DOS GRUPOS E PARALELIZAÇÃO
 # =============================================================================
-def process_group(group_data: pd.DataFrame, fornecedor: str, categoria: str, global_model: Optional[Any] = None) -> Tuple[pd.DataFrame, Optional[BaseForecastModel], Dict[str, Any]]:
+def process_group(group_data: pd.DataFrame, fornecedor: str, categoria: str, global_model: Optional[Any] = None) -> \
+Tuple[pd.DataFrame, Optional[BaseForecastModel], Dict[str, Any]]:
     group_data = group_data.sort_values('ano_mes').copy()
     group_data['MÊS'] = group_data['ano_mes'].str[-2:].astype(int)
 
@@ -1179,11 +1216,13 @@ def process_group(group_data: pd.DataFrame, fornecedor: str, categoria: str, glo
             group_data['AICc'] = np.nan
             group_data['wMAPE'] = np.nan
             return group_data, None, comparison
-            
-    wmape_vencedor = comparison.get('wmape', np.nan)
-    future_dates = pd.date_range(start=dates.iloc[-1] + pd.DateOffset(months=1), periods=CONFIG.forecast_horizon, freq='MS')
 
-    nome_modelo = 'ETS (Forçado Sazonal)' if comparison.get('modelo') == 'ETS (Forçado Sazonal)' else best_model.get_info()
+    wmape_vencedor = comparison.get('wmape', np.nan)
+    future_dates = pd.date_range(start=dates.iloc[-1] + pd.DateOffset(months=1), periods=CONFIG.forecast_horizon,
+                                 freq='MS')
+
+    nome_modelo = 'ETS (Forçado Sazonal)' if comparison.get(
+        'modelo') == 'ETS (Forçado Sazonal)' else best_model.get_info()
 
     df_forecast = pd.DataFrame({
         'fornecedor comercial': fornecedor, 'categoria': categoria,
@@ -1209,29 +1248,32 @@ def process_group(group_data: pd.DataFrame, fornecedor: str, categoria: str, glo
     return pd.concat([group_data, df_forecast], ignore_index=True), best_model, comparison
 
 
-def process_wrapper(args: Tuple[Tuple[str, str], pd.DataFrame], global_model: Optional[Any] = None) -> Tuple[str, str, Optional[pd.DataFrame], Dict[str, Any]]:
+def process_wrapper(args: Tuple[Tuple[str, str], pd.DataFrame], global_model: Optional[Any] = None) -> Tuple[
+    str, str, Optional[pd.DataFrame], Dict[str, Any]]:
     """Wrapper para Joblib blindado contra falhas de serialização."""
     try:
         import warnings
         warnings.simplefilter("ignore")
         os.environ["PYTHONWARNINGS"] = "ignore"
-        
+
         # Desliga loggers locais do worker
-        for logger_name in ['cmdstanpy', 'prophet', 'statsmodels', 'pystan', 'stan', 'prophet.plot', 'lightgbm', 'optuna']:
+        for logger_name in ['cmdstanpy', 'prophet', 'statsmodels', 'pystan', 'stan', 'prophet.plot', 'lightgbm',
+                            'optuna']:
             _logger = logging.getLogger(logger_name)
             _logger.setLevel(logging.CRITICAL)
 
         (fornecedor, categoria), group_data = args
         result, _, comparison = process_group(group_data, fornecedor, categoria, global_model)
-        
+
         # O group_data.copy() interno já protege a referência de memória, limpamos no fim explícito (boa prática Joblib)
-        del group_data 
-        
+        del group_data
+
         return fornecedor, categoria, result, comparison
 
     except Exception as e:
         (fornecedor, categoria), _ = args
-        return fornecedor, categoria, None, {'modelo': f'ERRO FATAL PARALELO: {str(e)[:100]}', 'wmape': None, 'all_results': {}}
+        return fornecedor, categoria, None, {'modelo': f'ERRO FATAL PARALELO: {str(e)[:100]}', 'wmape': None,
+                                             'all_results': {}}
 
 
 # =============================================================================
@@ -1250,9 +1292,9 @@ def main():
 
     # 2. Preparar Dados Consolidados
     df_agg = prepare_data(df, df_params)
-    
+
     global_model = train_global_model(df_agg)
-    
+
     # IMPORTANTE: Liberar o DF original da memória Principal
     del df
 
@@ -1276,7 +1318,8 @@ def main():
 
     logger.info("\n[4] Consolidando resultados...")
     resultados = []
-    modelo_stats = {'ETS': 0, 'SARIMA': 0, 'Prophet': 0, 'Theta': 0, 'LightGBM': 0, 'SBA': 0, 'Fallback': 0, 'Insuficiente': 0,
+    modelo_stats = {'ETS': 0, 'SARIMA': 0, 'Prophet': 0, 'Theta': 0, 'LightGBM': 0, 'SBA': 0, 'Fallback': 0,
+                    'Insuficiente': 0,
                     'Forçado Sazonal': 0, 'Erros Fatais': 0, 'Global Model': 0}
 
     for fornecedor, categoria, result, comparison in parallel_results:
@@ -1284,21 +1327,31 @@ def main():
             resultados.append(result)
             if comparison and comparison.get('modelo'):
                 mod = comparison['modelo']
-                if 'INSUF' in mod: modelo_stats['Insuficiente'] += 1
-                elif 'Forçado Sazonal' in mod: modelo_stats['Forçado Sazonal'] += 1
-                elif 'Global' in mod: modelo_stats['Global Model'] += 1
-                elif 'ETS' in mod: modelo_stats['ETS'] += 1
-                elif 'SARIMA' in mod: modelo_stats['SARIMA'] += 1
-                elif 'Prophet' in mod: modelo_stats['Prophet'] += 1
-                elif 'Theta' in mod: modelo_stats['Theta'] += 1
-                elif 'SBA' in mod: modelo_stats['SBA'] += 1
-                elif 'LightGBM' in mod: modelo_stats['LightGBM'] += 1
+                if 'INSUF' in mod:
+                    modelo_stats['Insuficiente'] += 1
+                elif 'Forçado Sazonal' in mod:
+                    modelo_stats['Forçado Sazonal'] += 1
+                elif 'Global' in mod:
+                    modelo_stats['Global Model'] += 1
+                elif 'ETS' in mod:
+                    modelo_stats['ETS'] += 1
+                elif 'SARIMA' in mod:
+                    modelo_stats['SARIMA'] += 1
+                elif 'Prophet' in mod:
+                    modelo_stats['Prophet'] += 1
+                elif 'Theta' in mod:
+                    modelo_stats['Theta'] += 1
+                elif 'SBA' in mod:
+                    modelo_stats['SBA'] += 1
+                elif 'LightGBM' in mod:
+                    modelo_stats['LightGBM'] += 1
                 elif 'Ensemble' in mod:
                     modelo_stats['Ensemble'] = modelo_stats.get('Ensemble', 0) + 1
-                else: modelo_stats['Fallback'] += 1
+                else:
+                    modelo_stats['Fallback'] += 1
         else:
             modelo_stats['Erros Fatais'] += 1
-            
+
     # Proteção de RAM
     del parallel_results
 
