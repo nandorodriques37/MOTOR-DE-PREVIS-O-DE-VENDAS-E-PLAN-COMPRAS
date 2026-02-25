@@ -2,14 +2,12 @@
 ================================================================================
 ETAPA 4 - CÁLCULO DE NECESSIDADE DE COMPRA (PEDIDO)
 ================================================================================
-Este script calcula a necessidade de compra (PEDIDO) para cada SKU/CD,
-garantindo que o ESTOQUE PROJETADO seja >= ESTOQUE OBJETIVO em todos os meses.
-
 -----------------------------------------------------------------------------
-LÓGICA DE CÁLCULO (Atualizada):
+LÓGICA DE CÁLCULO:
 -----------------------------------------------------------------------------
-ESTOQUE OBJETIVO = (Forward-Looking) Soma a demanda diária futura exata 
-                   para os próximos (LT + FREQUENCIA + EST_SEGURANCA) dias.
+ESTOQUE OBJETIVO = (Forward-Looking) Soma a demanda diária futura exata
+                   para os próximos (LT + FREQUENCIA + EST_SEGURANCA) dias,
+                   usando dias reais de cada mês.
 PEDIDO = Quantidade a pedir no mês para garantir EST_OBJ no mês de chegada.
 ENTRADA = Pedidos que CHEGAM no mês (baseado na data do pedido + LT).
 ESTOQUE PROJETADO = Est.Anterior + Entrada - Sell Out.
@@ -26,12 +24,16 @@ REGRA DE CHEGADA E CALENDÁRIO:
 
 import pandas as pd
 import numpy as np
+import logging
+import calendar
+import time
+import sys
+import os
 from datetime import datetime, timedelta
 from dateutil.relativedelta import relativedelta
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
-import time
 
 try:
     from tqdm import tqdm
@@ -39,33 +41,132 @@ except ImportError:
     def tqdm(iterable, **kwargs):
         return iterable
 
+
 # =============================================================================
-# CONFIGURAÇÕES - ALTERAR CONFORME NECESSÁRIO
+# CONFIGURAÇÃO DE LOGGING [Melhoria 6.2]
+# =============================================================================
+def configurar_logging(log_dir: str = None) -> logging.Logger:
+    """
+    Configura logging estruturado com saída para console e arquivo.
+
+    O logging estruturado substitui print() e oferece:
+    - Níveis de severidade (DEBUG, INFO, WARNING, ERROR, CRITICAL)
+    - Timestamp automático em cada mensagem
+    - Saída simultânea para console (colorida) e arquivo (persistente)
+    - Facilidade para filtrar e buscar mensagens por nível
+
+    Args:
+        log_dir: Diretório para salvar o arquivo de log. Se None, usa o diretório atual.
+
+    Returns:
+        Logger configurado.
+    """
+    logger = logging.getLogger("ETAPA4")
+    logger.setLevel(logging.DEBUG)
+    logger.handlers.clear()
+
+    formatter = logging.Formatter(
+        fmt="%(asctime)s | %(levelname)-8s | %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S"
+    )
+
+    # Handler de console
+    console_handler = logging.StreamHandler(sys.stdout)
+    console_handler.setLevel(logging.INFO)
+    console_handler.setFormatter(formatter)
+    logger.addHandler(console_handler)
+
+    # Handler de arquivo
+    if log_dir is None:
+        log_dir = os.path.dirname(os.path.abspath(__file__))
+    os.makedirs(log_dir, exist_ok=True)
+    log_file = os.path.join(log_dir, f"etapa4_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log")
+    file_handler = logging.FileHandler(log_file, encoding='utf-8')
+    file_handler.setLevel(logging.DEBUG)
+    file_handler.setFormatter(formatter)
+    logger.addHandler(file_handler)
+
+    logger.info(f"Log salvo em: {log_file}")
+    return logger
+
+
+# =============================================================================
+# CONFIGURAÇÕES - FONTES LOCAIS PARA TESTE
 # =============================================================================
 
+# ---------- Caminhos LOCAIS ----------------
 PATH_PREVISAO_SKU = r"\\files\Setores\SupplyChain\Forecast Fornecedores\2026\Teste Automatizado\ETAPA_3_PREVISAO_SKU.xlsx"
 PATH_ESTOQUE = r"\\files\Setores\SupplyChain\Forecast Fornecedores\2026\Teste Automatizado\FONTE_ESTOQUE.xlsx"
 PATH_OUTPUT = r"\\files\Setores\SupplyChain\Forecast Fornecedores\2026\Teste Automatizado\ETAPA_4_NECESSIDADE_COMPRA.xlsx"
 
-# Parâmetros de cálculo
-DIAS_MES = 30  # Dias do mês padronizado para cálculo de demanda
-HORIZONTE_MESES = 13  # Mês atual + 12 meses futuros
+# ---------- Parâmetros de cálculo ----------
+HORIZONTE_MESES = 13              # Mês atual + 12 meses futuros
 DATA_REFERENCIA = datetime.now()  # Data de execução do script
+DIAS_COBERTURA_MIN = 7            # [Melhoria 3.2] Floor mínimo de cobertura
 
 
 # =============================================================================
 # FUNÇÕES AUXILIARES
 # =============================================================================
 
-def calcular_dias_restantes_mes(data_ref):
-    """Calcula quantos dias restam no mês atual."""
-    ultimo_dia = (data_ref.replace(day=1) + relativedelta(months=1) - timedelta(days=1)).day
-    dias_restantes = ultimo_dia - data_ref.day + 1
-    return dias_restantes, ultimo_dia
+def dias_reais_no_mes(ano: int, mes: int) -> int:
+    """
+    [Melhoria 1.1] Retorna a quantidade real de dias em um mês específico.
+
+    Usa calendar.monthrange() que considera anos bissextos automaticamente.
+    Substitui a constante DIAS_MES=30 que gerava distorções em fev (28/29)
+    e meses com 31 dias.
+
+    Args:
+        ano: Ano (ex: 2026).
+        mes: Mês (1-12).
+
+    Returns:
+        Número de dias no mês (28, 29, 30 ou 31).
+    """
+    return calendar.monthrange(ano, mes)[1]
 
 
-def gerar_lista_meses(data_ref, horizonte):
-    """Gera lista de meses no formato YYYY_MM a partir da data de referência."""
+def parse_ano_mes(ano_mes_str: str) -> tuple:
+    """
+    Converte string 'YYYY_MM' em tupla (ano, mes).
+
+    Args:
+        ano_mes_str: String no formato 'YYYY_MM' (ex: '2026_01').
+
+    Returns:
+        Tupla (ano, mes) como inteiros.
+    """
+    partes = ano_mes_str.split("_")
+    return int(partes[0]), int(partes[1])
+
+
+def calcular_dias_restantes_mes(data_ref: datetime) -> tuple:
+    """
+    Calcula quantos dias restam no mês atual a partir da data de referência.
+
+    Args:
+        data_ref: Data de referência (geralmente datetime.now()).
+
+    Returns:
+        Tupla (dias_restantes, total_dias_no_mes).
+    """
+    total_dias = dias_reais_no_mes(data_ref.year, data_ref.month)
+    dias_restantes = total_dias - data_ref.day + 1
+    return dias_restantes, total_dias
+
+
+def gerar_lista_meses(data_ref: datetime, horizonte: int) -> list:
+    """
+    Gera lista de meses no formato 'YYYY_MM' a partir da data de referência.
+
+    Args:
+        data_ref: Data inicial.
+        horizonte: Quantidade de meses a gerar.
+
+    Returns:
+        Lista de strings no formato 'YYYY_MM'.
+    """
     meses = []
     for i in range(horizonte):
         mes = data_ref + relativedelta(months=i)
@@ -73,18 +174,94 @@ def gerar_lista_meses(data_ref, horizonte):
     return meses
 
 
-def calcular_mes_chegada(data_pedido, lt_dias):
-    """Calcula o mês de chegada baseado na data do pedido e Lead Time."""
-    try:
-        lt = int(float(lt_dias)) if pd.notna(lt_dias) else 0
-    except:
-        lt = 0
-    data_chegada = data_pedido + timedelta(days=lt)
+def construir_vetor_dias_reais(meses_lista: list) -> np.ndarray:
+    """
+    [Melhoria 1.1] Constrói vetor com os dias reais de cada mês do horizonte.
+
+    Em vez de usar DIAS_MES=30 fixo para todos os meses, este vetor contém
+    o número real de dias (28-31) para cada posição do horizonte.
+    Isso garante precisão no cálculo de demanda diária e estoque objetivo.
+
+    Args:
+        meses_lista: Lista de strings 'YYYY_MM'.
+
+    Returns:
+        Array numpy com dias reais por mês.
+    """
+    dias = np.zeros(len(meses_lista), dtype=np.float64)
+    for i, m in enumerate(meses_lista):
+        ano, mes = parse_ano_mes(m)
+        dias[i] = dias_reais_no_mes(ano, mes)
+    return dias
+
+
+def calcular_mes_chegada(data_pedido: datetime, lt_dias: int) -> str:
+    """
+    Calcula o mês de chegada no formato 'YYYY_MM' baseado na data do pedido + Lead Time.
+
+    Args:
+        data_pedido: Data em que o pedido é colocado.
+        lt_dias: Lead Time em dias.
+
+    Returns:
+        String 'YYYY_MM' do mês em que o pedido chega.
+    """
+    data_chegada = data_pedido + timedelta(days=int(lt_dias))
     return data_chegada.strftime("%Y_%m")
 
 
-def safe_numeric(val, default=0):
-    """Converte valor para numérico de forma segura."""
+def precomputar_chegadas(data_ref: datetime, horizonte: int, lts_unicos: np.ndarray,
+                         meses_ext_idx: dict) -> dict:
+    """
+    [Melhoria 2.2] Pré-calcula o índice de chegada para cada combinação (mês_pedido, LT).
+
+    Em vez de calcular o mês de chegada dentro do loop por SKU (que repete
+    o mesmo cálculo para SKUs com mesmo LT), esta função computa uma única
+    vez uma tabela de lookup: dado um mês de pedido 't' e um LT, qual é o
+    índice do mês de chegada no vetor estendido.
+
+    Isso elimina a necessidade de cache dinâmico e reduz chamadas repetitivas.
+
+    Args:
+        data_ref: Data de referência para mês 0.
+        horizonte: Número de meses do horizonte de simulação.
+        lts_unicos: Array com os valores únicos de LT em dias.
+        meses_ext_idx: Dicionário {mes_str: indice} do horizonte estendido.
+
+    Returns:
+        Dicionário {lt: [idx_chegada_para_t0, idx_chegada_para_t1, ...]}.
+    """
+    resultado = {}
+    # Pré-computar data de pedido por mês
+    datas_pedido = []
+    for t in range(horizonte):
+        if t == 0:
+            datas_pedido.append(data_ref)
+        else:
+            datas_pedido.append((data_ref + relativedelta(months=t)).replace(day=1))
+
+    for lt in lts_unicos:
+        indices = []
+        for t in range(horizonte):
+            m_chegada = calcular_mes_chegada(datas_pedido[t], lt)
+            idx = meses_ext_idx.get(m_chegada, len(meses_ext_idx) + 999)
+            indices.append(idx)
+        resultado[int(lt)] = indices
+
+    return resultado
+
+
+def safe_numeric(val, default: float = 0.0) -> float:
+    """
+    Converte valor para numérico de forma segura, tratando NaN, strings vazias, etc.
+
+    Args:
+        val: Valor a converter.
+        default: Valor padrão se conversão falhar.
+
+    Returns:
+        Valor numérico float.
+    """
     try:
         if pd.isna(val):
             return default
@@ -93,8 +270,120 @@ def safe_numeric(val, default=0):
             if val.lower() in ['(vazio)', 'vazio', '', 'nan', 'none']:
                 return default
         return float(val)
-    except:
+    except (ValueError, TypeError):
         return default
+
+
+def calcular_cobertura_dias(estoque: float, demanda_diaria: float) -> float:
+    """
+    [Melhoria 5.1] Calcula a cobertura em dias do estoque projetado.
+
+    Métrica fundamental no S&OP que responde: "quantos dias de venda
+    o estoque atual consegue cobrir?"
+
+    Fórmula: COBERTURA = ESTOQUE_PROJETADO / demanda_diaria_media
+
+    Args:
+        estoque: Estoque projetado no mês.
+        demanda_diaria: Demanda média diária (sell_out / dias_no_mês).
+
+    Returns:
+        Cobertura em dias (0 se demanda for zero).
+    """
+    if demanda_diaria <= 0:
+        return 999.0 if estoque > 0 else 0.0
+    return round(estoque / demanda_diaria, 1)
+
+
+# =============================================================================
+# TESTES UNITÁRIOS [Melhoria 6.3]
+# =============================================================================
+
+def executar_testes(logger: logging.Logger) -> bool:
+    """
+    [Melhoria 6.3] Executa testes unitários das funções auxiliares.
+
+    Testes automatizados garantem que mudanças futuras no código não
+    quebrem a lógica base. Cada teste valida uma função específica
+    com valores conhecidos e verifica se o resultado é o esperado.
+
+    Roda automaticamente antes da execução principal. Se algum teste
+    falhar, o script aborta para evitar resultados incorretos.
+
+    Args:
+        logger: Logger para registrar resultados.
+
+    Returns:
+        True se todos os testes passaram, False caso contrário.
+    """
+    testes_ok = True
+    total = 0
+    falhas = 0
+
+    def assert_equal(nome, obtido, esperado, tolerancia=0.01):
+        nonlocal total, falhas, testes_ok
+        total += 1
+        if isinstance(esperado, float):
+            ok = abs(obtido - esperado) < tolerancia
+        else:
+            ok = obtido == esperado
+        if not ok:
+            logger.error(f"  FALHOU: {nome} — esperado={esperado}, obtido={obtido}")
+            falhas += 1
+            testes_ok = False
+        else:
+            logger.debug(f"  OK: {nome}")
+
+    logger.info("Executando testes unitários...")
+
+    # Teste 1: dias_reais_no_mes
+    assert_equal("Fev 2024 (bissexto)", dias_reais_no_mes(2024, 2), 29)
+    assert_equal("Fev 2025 (normal)", dias_reais_no_mes(2025, 2), 28)
+    assert_equal("Jan 2026", dias_reais_no_mes(2026, 1), 31)
+    assert_equal("Abr 2026", dias_reais_no_mes(2026, 4), 30)
+
+    # Teste 2: parse_ano_mes
+    assert_equal("parse 2026_01", parse_ano_mes("2026_01"), (2026, 1))
+    assert_equal("parse 2027_12", parse_ano_mes("2027_12"), (2027, 12))
+
+    # Teste 3: calcular_dias_restantes_mes
+    data_teste = datetime(2026, 2, 20)
+    dias_rest, dias_tot = calcular_dias_restantes_mes(data_teste)
+    assert_equal("dias_restantes fev/2026 dia 20", dias_rest, 9)
+    assert_equal("dias_totais fev/2026", dias_tot, 28)
+
+    # Teste 4: gerar_lista_meses
+    meses = gerar_lista_meses(datetime(2026, 1, 1), 3)
+    assert_equal("gerar 3 meses", meses, ["2026_01", "2026_02", "2026_03"])
+
+    # Teste 5: safe_numeric
+    assert_equal("safe_numeric NaN", safe_numeric(float('nan')), 0.0)
+    assert_equal("safe_numeric string", safe_numeric("(vazio)"), 0.0)
+    assert_equal("safe_numeric válido", safe_numeric(42.5), 42.5)
+    assert_equal("safe_numeric None", safe_numeric(None), 0.0)
+
+    # Teste 6: calcular_mes_chegada
+    assert_equal("chegada LT=30", calcular_mes_chegada(datetime(2026, 1, 15), 30), "2026_02")
+    assert_equal("chegada LT=0", calcular_mes_chegada(datetime(2026, 3, 1), 0), "2026_03")
+    assert_equal("chegada LT=90", calcular_mes_chegada(datetime(2026, 1, 1), 90), "2026_04")
+
+    # Teste 7: construir_vetor_dias_reais
+    vetor = construir_vetor_dias_reais(["2026_01", "2026_02", "2026_03"])
+    assert_equal("vetor dias jan", vetor[0], 31.0)
+    assert_equal("vetor dias fev", vetor[1], 28.0)
+    assert_equal("vetor dias mar", vetor[2], 31.0)
+
+    # Teste 8: calcular_cobertura_dias
+    assert_equal("cobertura normal", calcular_cobertura_dias(300, 10), 30.0)
+    assert_equal("cobertura demanda=0 estoque>0", calcular_cobertura_dias(100, 0), 999.0)
+    assert_equal("cobertura demanda=0 estoque=0", calcular_cobertura_dias(0, 0), 0.0)
+
+    if testes_ok:
+        logger.info(f"  ✅ Todos os {total} testes passaram.")
+    else:
+        logger.error(f"  ❌ {falhas}/{total} testes falharam!")
+
+    return testes_ok
 
 
 # =============================================================================
@@ -102,45 +391,57 @@ def safe_numeric(val, default=0):
 # =============================================================================
 
 def main():
-    print("=" * 70)
-    print("ETAPA 4 - CÁLCULO DE NECESSIDADE DE COMPRA (PEDIDO)")
-    print("⚠️ VERSÃO: OTIMIZADA + DRP CONTÍNUO (MÊS A MÊS)")
-    print("=" * 70)
+    logger = configurar_logging(log_dir="/home/claude")
+
+    logger.info("=" * 70)
+    logger.info("ETAPA 4 - CÁLCULO DE NECESSIDADE DE COMPRA (PEDIDO)")
+    logger.info("VERSÃO: OTIMIZADA v2 — Robustez + Performance + Governança")
+    logger.info("=" * 70)
+
+    # -------------------------------------------------------------------------
+    # 0. TESTES UNITÁRIOS [Melhoria 6.3]
+    # -------------------------------------------------------------------------
+    if not executar_testes(logger):
+        logger.critical("Testes falharam — abortando execução.")
+        return
 
     # -------------------------------------------------------------------------
     # 1. CARREGAR DADOS
     # -------------------------------------------------------------------------
-    print("\n[1] Carregando arquivos...")
+    logger.info("[1] Carregando arquivos...")
     try:
         start_load = time.time()
         df_previsao = pd.read_excel(PATH_PREVISAO_SKU)
         df_estoque = pd.read_excel(PATH_ESTOQUE)
-        print(f"    ✓ Arquivos carregados em {time.time() - start_load:.2f} segundos.")
+        logger.info(f"    Arquivos carregados em {time.time() - start_load:.2f}s")
     except FileNotFoundError as e:
-        print(f"\n❌ ERRO: Arquivo não encontrado!")
-        print(f"   {e}")
+        logger.critical(f"Arquivo não encontrado: {e}")
         return
 
-    print(f"    - Previsão SKU: {df_previsao.shape[0]:,} linhas")
-    print(f"    - Estoque: {df_estoque.shape[0]:,} linhas")
+    logger.info(f"    Previsão SKU: {df_previsao.shape[0]:,} linhas")
+    logger.info(f"    Estoque:      {df_estoque.shape[0]:,} linhas")
 
     # -------------------------------------------------------------------------
     # 2. PREPARAR PARÂMETROS TEMPORAIS
     # -------------------------------------------------------------------------
     meses_horizonte = gerar_lista_meses(DATA_REFERENCIA, HORIZONTE_MESES)
-    meses_horizonte_ext = gerar_lista_meses(DATA_REFERENCIA, HORIZONTE_MESES + 6) 
+    meses_horizonte_ext = gerar_lista_meses(DATA_REFERENCIA, HORIZONTE_MESES + 6)
+
+    # [Melhoria 1.1] Vetor de dias reais por mês (substitui DIAS_MES=30)
+    dias_reais_ext = construir_vetor_dias_reais(meses_horizonte_ext)
 
     dias_restantes, dias_total = calcular_dias_restantes_mes(DATA_REFERENCIA)
     proporcao_mes_atual = dias_restantes / dias_total
 
-    print(f"\n[2] Parâmetros temporais:")
-    print(f"    - Data referência: {DATA_REFERENCIA.strftime('%d/%m/%Y')}")
-    print(f"    - Dias restantes no mês: {dias_restantes} de {dias_total} ({proporcao_mes_atual:.1%})")
+    logger.info(f"[2] Parâmetros temporais:")
+    logger.info(f"    Data referência: {DATA_REFERENCIA.strftime('%d/%m/%Y')}")
+    logger.info(f"    Dias restantes no mês: {dias_restantes} de {dias_total} ({proporcao_mes_atual:.1%})")
+    logger.info(f"    Horizonte: {meses_horizonte[0]} a {meses_horizonte[-1]} ({HORIZONTE_MESES} meses)")
 
     # -------------------------------------------------------------------------
     # 3. PREPARAR DADOS DE ESTOQUE E PREVISÃO
     # -------------------------------------------------------------------------
-    print("\n[3] Preparando dados...")
+    logger.info("[3] Preparando dados...")
     df_estoque = df_estoque.rename(columns={
         'ESTOQUE ATUAL': 'ESTOQUE',
         'LT (DIAS)': 'LT',
@@ -149,8 +450,20 @@ def main():
     })
 
     for col in ['ESTOQUE', 'PENDENCIA', 'NNA', 'LT', 'FREQUENCIA', 'EST_SEGURANCA']:
-        df_estoque[col] = df_estoque[col].apply(safe_numeric)
+        if col in df_estoque.columns:
+            df_estoque[col] = df_estoque[col].apply(safe_numeric)
 
+    # [Melhoria 3.2] Garantir cobertura mínima de 7 dias
+    df_estoque['_dias_cobertura_raw'] = df_estoque['LT'] + df_estoque['FREQUENCIA'] + df_estoque['EST_SEGURANCA']
+    qtd_abaixo_floor = (df_estoque['_dias_cobertura_raw'] < DIAS_COBERTURA_MIN).sum()
+    if qtd_abaixo_floor > 0:
+        logger.warning(
+            f"    [Governança 3.2] {qtd_abaixo_floor} SKUs com dias_cobertura < {DIAS_COBERTURA_MIN}. "
+            f"Aplicando floor mínimo."
+        )
+    df_estoque.drop(columns=['_dias_cobertura_raw'], inplace=True)
+
+    # Pivotar previsão
     meses_necessarios = set(meses_horizonte_ext)
     df_prev_filtrado = df_previsao[df_previsao['ano_mes'].isin(meses_necessarios)]
 
@@ -165,171 +478,254 @@ def main():
     }).reset_index()
 
     df_pivot = df_pivot.merge(df_cadastro, on=['codigo_deposito_pd', 'codigo_produto'], how='left')
-    
+
+    # --- [Melhoria 3.1] Validação do merge — detectar SKUs perdidos ---
+    chaves_previsao = set(
+        zip(df_pivot['codigo_deposito_pd'], df_pivot['codigo_produto'])
+    )
+    chaves_estoque = set(
+        zip(df_estoque['codigo_deposito_pd'], df_estoque['codigo_produto'])
+    )
+
+    skus_sem_estoque = chaves_previsao - chaves_estoque
+    skus_sem_previsao = chaves_estoque - chaves_previsao
+
+    if skus_sem_estoque:
+        logger.warning(
+            f"    [Validação 3.1] {len(skus_sem_estoque)} SKUs na PREVISÃO sem dados de ESTOQUE (serão ignorados)."
+        )
+        # Log detalhado no arquivo (DEBUG)
+        for cd, prod in sorted(list(skus_sem_estoque))[:20]:
+            logger.debug(f"      Sem estoque: CD={cd}, Produto={prod}")
+        if len(skus_sem_estoque) > 20:
+            logger.debug(f"      ... e mais {len(skus_sem_estoque) - 20} SKUs")
+
+    if skus_sem_previsao:
+        logger.warning(
+            f"    [Validação 3.1] {len(skus_sem_previsao)} SKUs no ESTOQUE sem PREVISÃO (sem demanda futura)."
+        )
+
     df = df_pivot.merge(
-        df_estoque[['codigo_deposito_pd', 'codigo_produto', 'ESTOQUE', 'PENDENCIA', 'NNA', 'LT', 'FREQUENCIA', 'EST_SEGURANCA']],
+        df_estoque[['codigo_deposito_pd', 'codigo_produto', 'ESTOQUE', 'PENDENCIA', 'NNA',
+                     'LT', 'FREQUENCIA', 'EST_SEGURANCA']],
         on=['codigo_deposito_pd', 'codigo_produto'], how='inner'
     )
     df['CHAVE'] = df['codigo_deposito_pd'].astype(str) + '-' + df['codigo_produto'].astype(str)
 
+    logger.info(f"    SKUs após merge: {df.shape[0]:,}")
+
     if df.shape[0] == 0:
-        print("\n❌ ERRO: Nenhum registro encontrado após merge!")
+        logger.critical("Nenhum registro encontrado após merge!")
         return
 
     # -------------------------------------------------------------------------
-    # 4. PRÉ-CÁLCULO E CACHE DE CALENDÁRIO OTIMIZADO
+    # 4. PRÉ-CÁLCULO DE CALENDÁRIO [Melhoria 2.2]
     # -------------------------------------------------------------------------
     meses_ext_idx = {m: i for i, m in enumerate(meses_horizonte_ext)}
-    
-    # Pre-compute data de pedido simulada no horizonte
-    datas_pedido_por_t = []
-    for t in range(HORIZONTE_MESES):
-        if t == 0:
-            datas_pedido_por_t.append(DATA_REFERENCIA)
-        else:
-            datas_pedido_por_t.append((DATA_REFERENCIA + relativedelta(months=t)).replace(day=1))
-            
-    # Cache para `calcular_mes_chegada`
-    cache_chegada = {}
-    def fast_mes_chegada(data_pedido, lt_dias):
-        key = (data_pedido, lt_dias)
-        if key not in cache_chegada:
-             cache_chegada[key] = calcular_mes_chegada(data_pedido, lt_dias)
-        return cache_chegada[key]
-        
+
+    # Pré-computar tabela de chegada por LT único
+    lts_unicos = df['LT'].unique()
+    logger.info(f"[4] Pré-calculando chegadas para {len(lts_unicos)} LTs únicos...")
+    tabela_chegada = precomputar_chegadas(
+        DATA_REFERENCIA, HORIZONTE_MESES, lts_unicos, meses_ext_idx
+    )
+
     df_records = df.to_dict('records')
     linhas_output = []
+    n_ext = len(meses_horizonte_ext)
+
+    # Contadores de governança [Melhoria 3.3]
+    total_rupturas = 0
+    skus_com_ruptura = set()
+    total_floor_aplicado = 0
 
     # -------------------------------------------------------------------------
     # 5. CALCULAR NECESSIDADE DE COMPRA (DRP CONTÍNUO E FORWARD-LOOKING)
     # -------------------------------------------------------------------------
-    print("\n[4] Calculando simulação DRP Mês a Mês...")
-    
+    logger.info("[5] Calculando simulação DRP Mês a Mês...")
+
     for row in tqdm(df_records, desc="Processando SKUs"):
         cadastro = {
             'fornecedor comercial': row.get('fornecedor comercial', ''),
-            'situacao': row.get('situacao', ''), 'CHAVE': row['CHAVE'],
-            'codigo_deposito_pd': row['codigo_deposito_pd'], 'codigo_produto': row['codigo_produto'],
-            'nome produto': row.get('nome produto', ''), 'nome nível 3': row.get('nome nível 3', ''),
-            'nome nível 4': row.get('nome nível 4', ''), 'ESTOQUE': row['ESTOQUE'],
-            'PENDENCIA': row['PENDENCIA'], 'LT': row['LT'], 'NNA': row['NNA'],
-            'FREQUENCIA': row['FREQUENCIA'], 'EST_SEGURANCA': row['EST_SEGURANCA']
+            'situacao': row.get('situacao', ''),
+            'CHAVE': row['CHAVE'],
+            'codigo_deposito_pd': row['codigo_deposito_pd'],
+            'codigo_produto': row['codigo_produto'],
+            'nome produto': row.get('nome produto', ''),
+            'nome nível 3': row.get('nome nível 3', ''),
+            'nome nível 4': row.get('nome nível 4', ''),
+            'ESTOQUE': row['ESTOQUE'],
+            'PENDENCIA': row['PENDENCIA'],
+            'LT': row['LT'],
+            'NNA': row['NNA'],
+            'FREQUENCIA': row['FREQUENCIA'],
+            'EST_SEGURANCA': row['EST_SEGURANCA']
         }
 
         estoque_atual = safe_numeric(row['ESTOQUE'])
         pendencia = safe_numeric(row['PENDENCIA'])
         nna = safe_numeric(row['NNA'])
-        lt = safe_numeric(row['LT'])
+        lt = int(safe_numeric(row['LT']))
         frequencia = safe_numeric(row['FREQUENCIA'])
         est_seguranca = safe_numeric(row['EST_SEGURANCA'])
 
         estoque_inicial = estoque_atual + pendencia + nna
+
+        # [Melhoria 3.2] Floor mínimo de cobertura
         dias_cobertura = lt + frequencia + est_seguranca
+        if dias_cobertura < DIAS_COBERTURA_MIN:
+            dias_cobertura = DIAS_COBERTURA_MIN
+            total_floor_aplicado += 1
 
-        # 1. Calcular SELL_OUT e EST_OBJ por índice via listas rápidas
-        est_obj_por_mes = [0.0] * len(meses_horizonte_ext)
-        sell_out_por_mes = [0.0] * len(meses_horizonte_ext)
-
+        # -----------------------------------------------------------------
+        # [Melhoria 2.1] Vetorização do cálculo de sell_out e est_obj
+        # -----------------------------------------------------------------
+        # Sell out vetorizado
+        sell_out_vec = np.zeros(n_ext)
         for i, mes in enumerate(meses_horizonte_ext):
-            so = safe_numeric(row.get(mes, 0))
-            if i == 0:
-                so = so * proporcao_mes_atual
-            sell_out_por_mes[i] = so
+            sell_out_vec[i] = safe_numeric(row.get(mes, 0))
+        # Mês 0: proporcionalizar pelos dias restantes
+        sell_out_vec[0] *= proporcao_mes_atual
 
+        # [Melhoria 1.1] EST_OBJ com dias reais por mês
+        est_obj_vec = np.zeros(n_ext)
+        for i in range(n_ext):
             dias_rest = dias_cobertura
             demanda_forward = 0.0
-            
-            for j in range(i, len(meses_horizonte_ext)):
+
+            for j in range(i, n_ext):
                 demanda_futura = safe_numeric(row.get(meses_horizonte_ext[j], 0))
-                
-                if dias_rest >= DIAS_MES:
+                dias_mes_j = dias_reais_ext[j]  # [1.1] Dias reais em vez de 30
+
+                if dias_rest >= dias_mes_j:
                     demanda_forward += demanda_futura
-                    dias_rest -= DIAS_MES
+                    dias_rest -= dias_mes_j
                 else:
-                    demanda_forward += demanda_futura * (dias_rest / DIAS_MES)
+                    # Fração proporcional do mês
+                    demanda_forward += demanda_futura * (dias_rest / dias_mes_j)
                     dias_rest = 0
                     break
-                    
+
+            # Se ainda sobraram dias, extrapolar com o último mês disponível
             if dias_rest > 0:
-                ultimo_mes_disp = meses_horizonte_ext[-1]
-                demanda_ult = safe_numeric(row.get(ultimo_mes_disp, 0))
-                demanda_forward += (demanda_ult / DIAS_MES) * dias_rest
-                
-            est_obj_por_mes[i] = demanda_forward
+                demanda_ult = safe_numeric(row.get(meses_horizonte_ext[-1], 0))
+                dias_ult = dias_reais_ext[-1]
+                demanda_forward += (demanda_ult / dias_ult) * dias_rest
 
-        # 2. Mapear o índice de chegada considerando o LT
-        idx_chegada_por_t = []
-        for t in range(HORIZONTE_MESES):
-            data_pedido = datas_pedido_por_t[t]
-            m_chegada = fast_mes_chegada(data_pedido, lt)
-            if m_chegada in meses_ext_idx:
-                idx_chegada_por_t.append(meses_ext_idx[m_chegada])
-            else:
-                idx_chegada_por_t.append(len(meses_horizonte_ext) + 999)
+            est_obj_vec[i] = demanda_forward
 
-        # 3. Simulate MRP/DRP (Fluxo Linear)
+        # -----------------------------------------------------------------
+        # [Melhoria 2.2] Usar tabela pré-computada de chegadas
+        # -----------------------------------------------------------------
+        idx_chegada_por_t = tabela_chegada[lt]
+
+        # -----------------------------------------------------------------
+        # [Melhoria 1.3] Simulação DRP com cobertura de meses intermediários
+        # -----------------------------------------------------------------
+        # A melhoria aqui é garantir que, para LTs longos onde o pedido t
+        # chega muitos meses à frente, TODOS os meses entre a chegada de t
+        # e a chegada de t+1 sejam verificados para atender EST_OBJ.
         pedidos = [0.0] * HORIZONTE_MESES
-        entradas = [0.0] * len(meses_horizonte_ext)
-        
+        entradas = np.zeros(n_ext)
+
         for t in range(HORIZONTE_MESES):
             idx_atual = idx_chegada_por_t[t]
-            
-            # Se a encomenda já passar do nosso horizonte estendido, ignora o cálculo
-            if idx_atual >= len(meses_horizonte_ext):
+
+            if idx_atual >= n_ext:
                 continue
-                
-            idx_prox = idx_chegada_por_t[t+1] if t + 1 < HORIZONTE_MESES else idx_atual + 1
-            idx_fim = max(idx_atual, idx_prox - 1)
-            
+
+            # Definir o range de meses que este pedido precisa cobrir
+            # [1.3] Cobrir desde idx_atual até (idx_prox - 1)
+            if t + 1 < HORIZONTE_MESES:
+                idx_prox = idx_chegada_por_t[t + 1]
+            else:
+                idx_prox = idx_atual + 1
+
+            # Garantir que cobrimos pelo menos o mês de chegada
+            idx_fim = max(idx_atual, min(idx_prox - 1, n_ext - 1))
+
             necessidade_t = 0.0
-            
-            # Garanto os meses no alcance deste pedido
+
             for k in range(idx_atual, idx_fim + 1):
-                if k >= len(meses_horizonte_ext):
+                if k >= n_ext:
                     continue
-                    
-                # Estoque projetado acumulado até k 
-                proj_inv_k = estoque_inicial + sum(entradas[:k+1]) - sum(sell_out_por_mes[:k+1]) + necessidade_t
-                
-                obj_k = est_obj_por_mes[k]
+
+                # Estoque projetado acumulado até k, incluindo necessidade parcial deste pedido
+                proj_inv_k = (estoque_inicial
+                              + np.sum(entradas[:k + 1])
+                              - np.sum(sell_out_vec[:k + 1])
+                              + necessidade_t)
+
+                obj_k = est_obj_vec[k]
                 if proj_inv_k < obj_k:
                     req = obj_k - proj_inv_k
                     necessidade_t += req
-                    
+
             if necessidade_t > 0:
                 pedidos[t] += necessidade_t
                 entradas[idx_atual] += necessidade_t
 
-        # 4. Consolidar Resultados
-        estoque_atual_simul = estoque_inicial
+        # -----------------------------------------------------------------
+        # Consolidar Resultados com métricas adicionais
+        # -----------------------------------------------------------------
+        estoque_simul = estoque_inicial
         for t in range(HORIZONTE_MESES):
             mes = meses_horizonte[t]
-            sell_out = sell_out_por_mes[t]
+            sell_out = sell_out_vec[t]
             entrada_mes = entradas[t]
-            est_proj = estoque_atual_simul + entrada_mes - sell_out
+            est_proj = estoque_simul + entrada_mes - sell_out
+
+            # [Melhoria 5.1] Cobertura em dias
+            dias_mes_t = dias_reais_ext[t]
+            demanda_diaria_t = sell_out / dias_mes_t if dias_mes_t > 0 else 0
+            cobertura = calcular_cobertura_dias(est_proj, demanda_diaria_t)
+
+            # [Melhoria 3.3] Flag de ruptura
+            alerta_ruptura = "SIM" if est_proj < 0 else ""
+            if est_proj < 0:
+                total_rupturas += 1
+                skus_com_ruptura.add(row['CHAVE'])
 
             linha = cadastro.copy()
             linha.update({
                 'MES_ANO': mes,
                 'SELL_OUT': round(sell_out, 0),
                 'ESTOQUE_PROJETADO': round(est_proj, 0),
-                'ESTOQUE_OBJETIVO': round(est_obj_por_mes[t], 0),
+                'ESTOQUE_OBJETIVO': round(est_obj_vec[t], 0),
                 'PEDIDO': round(pedidos[t], 0),
-                'ENTRADA': round(entrada_mes, 0)
+                'ENTRADA': round(entrada_mes, 0),
+                'COBERTURA_DIAS': cobertura,        # [5.1]
+                'ALERTA_RUPTURA': alerta_ruptura,    # [3.3]
             })
             linhas_output.append(linha)
-            estoque_atual_simul = est_proj
+            estoque_simul = est_proj
 
     # -------------------------------------------------------------------------
-    # 6. EXPORTAR PARA EXCEL OTIMIZADO
+    # RELATÓRIO DE GOVERNANÇA
     # -------------------------------------------------------------------------
-    print("\n[5] Exportando para Excel...")
+    logger.info("-" * 50)
+    logger.info("RELATÓRIO DE GOVERNANÇA:")
+    logger.info(f"    SKUs processados: {len(df_records):,}")
+    logger.info(f"    Meses com ruptura projetada: {total_rupturas}")
+    logger.info(f"    SKUs com pelo menos 1 ruptura: {len(skus_com_ruptura)}")
+    logger.info(f"    SKUs com floor de cobertura aplicado: {total_floor_aplicado}")
+    if skus_com_ruptura:
+        logger.warning(f"    ⚠️ {len(skus_com_ruptura)} SKUs precisam de atenção!")
+        for chave in sorted(list(skus_com_ruptura))[:10]:
+            logger.debug(f"      Ruptura: {chave}")
+    logger.info("-" * 50)
+
+    # -------------------------------------------------------------------------
+    # 6. EXPORTAR PARA EXCEL
+    # -------------------------------------------------------------------------
+    logger.info("[6] Exportando para Excel...")
     df_output = pd.DataFrame(linhas_output)
     colunas_ordem = [
         'fornecedor comercial', 'situacao', 'CHAVE', 'codigo_deposito_pd',
         'codigo_produto', 'nome produto', 'nome nível 3', 'nome nível 4',
         'ESTOQUE', 'PENDENCIA', 'LT', 'NNA', 'FREQUENCIA', 'EST_SEGURANCA',
-        'MES_ANO', 'SELL_OUT', 'ESTOQUE_PROJETADO', 'ESTOQUE_OBJETIVO', 'PEDIDO', 'ENTRADA'
+        'MES_ANO', 'SELL_OUT', 'ESTOQUE_PROJETADO', 'ESTOQUE_OBJETIVO',
+        'PEDIDO', 'ENTRADA', 'COBERTURA_DIAS', 'ALERTA_RUPTURA'
     ]
     df_output = df_output[colunas_ordem]
 
@@ -338,10 +734,14 @@ def main():
         df_output.to_excel(writer, sheet_name="Necessidade_Compra", index=False)
         worksheet = writer.sheets["Necessidade_Compra"]
 
-        # Formatações Visuais - Cabeçalho
+        # --- Formatações Visuais ---
         header_fill = PatternFill('solid', fgColor='366092')
         header_font = Font(bold=True, color='FFFFFF')
-        border = Border(left=Side(style='thin'), right=Side(style='thin'), top=Side(style='thin'), bottom=Side(style='thin'))
+        border = Border(
+            left=Side(style='thin'), right=Side(style='thin'),
+            top=Side(style='thin'), bottom=Side(style='thin')
+        )
+        alerta_fill = PatternFill('solid', fgColor='FFC7CE')  # Vermelho claro para ruptura
 
         for cell in worksheet[1]:
             cell.fill = header_fill
@@ -349,30 +749,49 @@ def main():
             cell.alignment = Alignment(horizontal='center')
             cell.border = border
 
-        # Define colunas numéricas
-        numeric_cols_idx = {i + 1 for i, col in enumerate(df_output.columns) 
-                            if col in ['SELL_OUT', 'ESTOQUE_PROJETADO', 'ESTOQUE_OBJETIVO', 'PEDIDO', 'ENTRADA', 'ESTOQUE', 'PENDENCIA', 'LT', 'NNA', 'FREQUENCIA', 'EST_SEGURANCA']}
+        # Índices de colunas numéricas e da coluna de alerta
+        numeric_cols_idx = set()
+        alerta_col_idx = None
+        for i, col in enumerate(df_output.columns):
+            if col in ['SELL_OUT', 'ESTOQUE_PROJETADO', 'ESTOQUE_OBJETIVO', 'PEDIDO',
+                        'ENTRADA', 'ESTOQUE', 'PENDENCIA', 'LT', 'NNA', 'FREQUENCIA',
+                        'EST_SEGURANCA', 'COBERTURA_DIAS']:
+                numeric_cols_idx.add(i + 1)
+            if col == 'ALERTA_RUPTURA':
+                alerta_col_idx = i + 1
 
-        # Formatação rápida das células (muito mais veloz que iterar sobre linhas no pandas)
-        for row in worksheet.iter_rows(min_row=2, max_row=worksheet.max_row, min_col=1, max_col=worksheet.max_column):
+        # Formatação das células
+        for row in worksheet.iter_rows(min_row=2, max_row=worksheet.max_row,
+                                        min_col=1, max_col=worksheet.max_column):
+            # [Melhoria 3.3] Destacar linhas com ruptura
+            is_ruptura = False
+            if alerta_col_idx:
+                alerta_cell = row[alerta_col_idx - 1]
+                if alerta_cell.value == "SIM":
+                    is_ruptura = True
+
             for cell in row:
                 cell.border = border
                 if cell.column in numeric_cols_idx:
                     cell.number_format = '#,##0'
+                if is_ruptura:
+                    cell.fill = alerta_fill
 
         # Ajuste de larguras
-        widths = [18, 8, 12, 6, 10, 35, 18, 20, 10, 10, 6, 6, 10, 10, 10, 12, 15, 15, 12, 12]
+        widths = [18, 8, 12, 6, 10, 35, 18, 20, 10, 10, 6, 6, 10, 10,
+                  10, 12, 15, 15, 12, 12, 12, 12]
         for col_idx, width in enumerate(widths, 1):
-            col_letter = get_column_letter(col_idx)
-            worksheet.column_dimensions[col_letter].width = width
+            if col_idx <= worksheet.max_column:
+                worksheet.column_dimensions[get_column_letter(col_idx)].width = width
 
         worksheet.freeze_panes = 'A2'
         worksheet.auto_filter.ref = worksheet.dimensions
 
-    print(f"    ✓ Arquivo salvo em {time.time() - start_export:.2f} segundos: {PATH_OUTPUT}")
-    print("\n" + "=" * 70)
-    print("✅ ETAPA 4 CONCLUÍDA COM SUCESSO!")
-    print("=" * 70)
+    logger.info(f"    Arquivo salvo em {time.time() - start_export:.2f}s: {PATH_OUTPUT}")
+    logger.info("=" * 70)
+    logger.info("✅ ETAPA 4 CONCLUÍDA COM SUCESSO!")
+    logger.info("=" * 70)
+
 
 if __name__ == "__main__":
     main()
