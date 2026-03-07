@@ -99,12 +99,12 @@ def aplicar_de_para(df, caminho_de_para):
 
     # Garantir mesmo tipo de dado para o join
     df['codigo_produto'] = df['codigo_produto'].astype(str).str.strip()
-    df_de_para['codigo_DE'] = df_de_para['codigo_DE'].astype(str).str.strip()
-    df_de_para['codigo_PARA'] = df_de_para['codigo_PARA'].astype(str).str.strip()
+    df_de_para['codigo_produto_DE'] = df_de_para['codigo_produto_DE'].astype(str).str.strip()
+    df_de_para['codigo_produto_PARA'] = df_de_para['codigo_produto_PARA'].astype(str).str.strip()
 
     # Criar dicionários de mapeamento
-    mapa_codigo = dict(zip(df_de_para['codigo_DE'], df_de_para['codigo_PARA']))
-    mapa_nome = dict(zip(df_de_para['codigo_DE'], df_de_para['nome_produto_PARA']))
+    mapa_codigo = dict(zip(df_de_para['codigo_produto_DE'], df_de_para['codigo_produto_PARA']))
+    mapa_nome = dict(zip(df_de_para['codigo_produto_DE'], df_de_para['nome_produto_PARA']))
 
     # Identificar registros afetados
     mascara = df['codigo_produto'].isin(mapa_codigo.keys())
