@@ -76,12 +76,12 @@ def aplicar_de_para(df, caminho_de_para):
 
     # Garantir mesmo tipo de dado para o join
     df['codigo_produto'] = df['codigo_produto'].astype(str).str.strip()
-    df_de_para['codigo_DE'] = df_de_para['codigo_DE'].astype(str).str.strip()
-    df_de_para['codigo_PARA'] = df_de_para['codigo_PARA'].astype(str).str.strip()
+    df_de_para['codigo_produto_DE'] = df_de_para['codigo_produto_DE'].astype(str).str.strip()
+    df_de_para['codigo_produto_PARA'] = df_de_para['codigo_produto_PARA'].astype(str).str.strip()
 
     # Criar dicionários de mapeamento
-    mapa_codigo = dict(zip(df_de_para['codigo_DE'], df_de_para['codigo_PARA']))
-    mapa_nome = dict(zip(df_de_para['codigo_DE'], df_de_para['nome_produto_PARA']))
+    mapa_codigo = dict(zip(df_de_para['codigo_produto_DE'], df_de_para['codigo_produto_PARA']))
+    mapa_nome = dict(zip(df_de_para['codigo_produto_DE'], df_de_para['nome_produto_PARA']))
 
     # Identificar registros afetados
     mascara = df['codigo_produto'].isin(mapa_codigo.keys())
@@ -272,6 +272,7 @@ def calcular_forecast_por_sku(df_share, df_previsao_futuro, mes_texto_para_numer
         'Fornecedor': 'fornecedor_join', 'Categoria': 'categoria_join',
         'Mes_Num': 'mes_join', 'CD': 'codigo_deposito_pd', 'SKU': 'codigo_produto'
     })
+    df_share_prep['codigo_produto'] = df_share_prep['codigo_produto'].astype(str).str.strip()
 
     df_prev_prep = df_previsao_futuro.rename(columns={
         'fornecedor comercial': 'fornecedor_join', 'categoria': 'categoria_join',
