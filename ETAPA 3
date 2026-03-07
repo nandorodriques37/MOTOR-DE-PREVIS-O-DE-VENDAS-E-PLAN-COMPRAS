@@ -32,6 +32,9 @@ PATH_SHARE = r"\\files\Setores\SupplyChain\Forecast Fornecedores\2026\Teste Auto
 PATH_PREVISAO = r"\\files\Setores\SupplyChain\Forecast Fornecedores\2026\Teste Automatizado\ETAPA_1_PREVISAO_CATEGORIA.xlsx"
 PATH_HISTORICO = r"\\files\Setores\SupplyChain\Forecast Fornecedores\2026\Teste Automatizado\ETAPA_0_HISTORICO.xlsx"
 
+# Caminho do arquivo de mapeamento DE→PARA (substituição de códigos de produto)
+PATH_DE_PARA = r"\\files\Setores\SupplyChain\Forecast Fornecedores\2026\Teste Automatizado\FONTE_DE_PARA.xlsx"
+
 # Caminho do arquivo de saída
 PATH_OUTPUT = r"\\files\Setores\SupplyChain\Forecast Fornecedores\2026\Teste Automatizado\ETAPA_3_PREVISAO_SKU.xlsx"
 
@@ -50,6 +53,50 @@ def criar_mapeamento_meses():
     return mes_texto_para_numero, mes_numero_para_texto
 
 
+def aplicar_de_para(df, caminho_de_para):
+    """
+    Aplica o mapeamento DE→PARA nos códigos e nomes de produto.
+    Substitui codigo_produto e nome produto antigos pelos novos conforme FONTE_DE_PARA.
+    """
+    print("\n    [1.1] Aplicando mapeamento DE→PARA no histórico...")
+
+    try:
+        df_de_para = pd.read_excel(caminho_de_para)
+        df_de_para.columns = df_de_para.columns.str.strip()
+    except FileNotFoundError:
+        print("      ⚠ Arquivo FONTE_DE_PARA não encontrado. Seguindo sem substituição.")
+        return df
+    except Exception as e:
+        print(f"      ⚠ Erro ao ler FONTE_DE_PARA: {e}. Seguindo sem substituição.")
+        return df
+
+    if df_de_para.empty:
+        print("      ⚠ Tabela DE→PARA vazia. Seguindo sem substituição.")
+        return df
+
+    # Garantir mesmo tipo de dado para o join
+    df['codigo_produto'] = df['codigo_produto'].astype(str).str.strip()
+    df_de_para['codigo_DE'] = df_de_para['codigo_DE'].astype(str).str.strip()
+    df_de_para['codigo_PARA'] = df_de_para['codigo_PARA'].astype(str).str.strip()
+
+    # Criar dicionários de mapeamento
+    mapa_codigo = dict(zip(df_de_para['codigo_DE'], df_de_para['codigo_PARA']))
+    mapa_nome = dict(zip(df_de_para['codigo_DE'], df_de_para['nome_produto_PARA']))
+
+    # Identificar registros afetados
+    mascara = df['codigo_produto'].isin(mapa_codigo.keys())
+    qtd_afetados = mascara.sum()
+
+    # Aplicar substituição de nome (antes de mudar o código) e depois código
+    df.loc[mascara, 'nome produto'] = df.loc[mascara, 'codigo_produto'].map(mapa_nome)
+    df.loc[mascara, 'codigo_produto'] = df.loc[mascara, 'codigo_produto'].map(mapa_codigo)
+
+    print(f"      ✓ Mapeamentos carregados: {len(mapa_codigo)}")
+    print(f"      ✓ Registros substituídos: {qtd_afetados:,}")
+
+    return df
+
+
 def carregar_dados():
     """Carrega os três arquivos de entrada e padroniza os nomes das colunas."""
     print("\n[1] Carregando arquivos...")
@@ -63,7 +110,10 @@ def carregar_dados():
     df_previsao.columns = df_previsao.columns.str.strip()
     df_historico.columns = df_historico.columns.str.strip()
 
-    # 2. Dicionário de Correção (De -> Para)
+    # 2. Aplicar mapeamento DE→PARA no histórico (antes de qualquer groupby)
+    df_historico = aplicar_de_para(df_historico, PATH_DE_PARA)
+
+    # 3. Dicionário de Correção (De -> Para)
     mapa_correcao = {
         'Fornecedor Comercial': 'fornecedor comercial',
         'Fornecedor': 'fornecedor comercial',
@@ -72,7 +122,7 @@ def carregar_dados():
         'Categoria': 'categoria',
         'Nome Nível 3': 'nome nível 3'
     }
-    
+
     df_previsao = df_previsao.rename(columns=mapa_correcao)
     df_historico = df_historico.rename(columns=mapa_correcao)
 

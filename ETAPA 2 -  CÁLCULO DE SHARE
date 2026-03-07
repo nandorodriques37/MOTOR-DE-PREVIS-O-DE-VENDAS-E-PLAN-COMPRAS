@@ -39,6 +39,9 @@ import os  # Para manipulação de caminhos de arquivos
 # Caminho do arquivo de entrada (sua base de vendas históricas)
 ARQUIVO_ENTRADA = r'\\files\Setores\SupplyChain\Forecast Fornecedores\2026\Teste Automatizado\ETAPA_0_HISTORICO.xlsx'
 
+# Caminho do arquivo de mapeamento DE→PARA (substituição de códigos de produto)
+ARQUIVO_DE_PARA = r'\\files\Setores\SupplyChain\Forecast Fornecedores\2026\Teste Automatizado\FONTE_DE_PARA.xlsx'
+
 # Nome do arquivo de saída (será salvo na mesma pasta do arquivo de entrada)
 ARQUIVO_SAIDA = 'ETAPA_2_SHARE_PRODUTO.xlsx'
 
@@ -63,6 +66,56 @@ def ler_arquivo(caminho):
 
     print(f"✓ Arquivo lido: {caminho}")
     print(f"  - Registros: {len(df):,}\n")
+
+    return df
+
+
+# ==============================================================================
+# ETAPA 1.1: APLICAÇÃO DO MAPEAMENTO DE→PARA (SUBSTITUIÇÃO DE CÓDIGOS)
+# ==============================================================================
+
+def aplicar_de_para(df, caminho_de_para):
+    """
+    Aplica o mapeamento DE→PARA nos códigos e nomes de produto.
+    Substitui codigo_produto e nome produto antigos pelos novos conforme FONTE_DE_PARA.
+    """
+    print("=" * 60)
+    print("ETAPA 1.1: Aplicando mapeamento DE→PARA...")
+    print("=" * 60)
+
+    try:
+        df_de_para = pd.read_excel(caminho_de_para)
+        df_de_para.columns = df_de_para.columns.str.strip()
+    except FileNotFoundError:
+        print("  ⚠ Arquivo FONTE_DE_PARA não encontrado. Seguindo sem substituição.\n")
+        return df
+    except Exception as e:
+        print(f"  ⚠ Erro ao ler FONTE_DE_PARA: {e}. Seguindo sem substituição.\n")
+        return df
+
+    if df_de_para.empty:
+        print("  ⚠ Tabela DE→PARA vazia. Seguindo sem substituição.\n")
+        return df
+
+    # Garantir mesmo tipo de dado para o join
+    df['codigo_produto'] = df['codigo_produto'].astype(str).str.strip()
+    df_de_para['codigo_DE'] = df_de_para['codigo_DE'].astype(str).str.strip()
+    df_de_para['codigo_PARA'] = df_de_para['codigo_PARA'].astype(str).str.strip()
+
+    # Criar dicionários de mapeamento
+    mapa_codigo = dict(zip(df_de_para['codigo_DE'], df_de_para['codigo_PARA']))
+    mapa_nome = dict(zip(df_de_para['codigo_DE'], df_de_para['nome_produto_PARA']))
+
+    # Identificar registros afetados
+    mascara = df['codigo_produto'].isin(mapa_codigo.keys())
+    qtd_afetados = mascara.sum()
+
+    # Aplicar substituição de código e nome
+    df.loc[mascara, 'nome produto'] = df.loc[mascara, 'codigo_produto'].map(mapa_nome)
+    df.loc[mascara, 'codigo_produto'] = df.loc[mascara, 'codigo_produto'].map(mapa_codigo)
+
+    print(f"  ✓ Mapeamentos carregados: {len(mapa_codigo)}")
+    print(f"  ✓ Registros substituídos: {qtd_afetados:,}\n")
 
     return df
 
@@ -490,6 +543,7 @@ if __name__ == "__main__":
 
     # Executa todas as etapas
     df = ler_arquivo(ARQUIVO_ENTRADA)
+    df = aplicar_de_para(df, ARQUIVO_DE_PARA)
     df = preparar_dados(df)
     share_saz = calcular_share_sazonal(df)
     share_rec = calcular_share_recente(df)
