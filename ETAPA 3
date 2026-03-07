@@ -1,20 +1,22 @@
 """
 ================================================================================
-ETAPA 3 - PREVISÃO DE VENDAS POR SKU (VERSÃO LOCAL - FINAL)
+ETAPA 3 - PREVISÃO DE VENDAS POR SKU (VERSÃO LOCAL - v2)
 ================================================================================
 Este script gera a previsão de vendas no nível SKU/CD/Mês/Ano, combinando:
 - Base de Share Híbrido Renormalizado (share por SKU/CD/Mês)
 - Base de Previsão por Fornecedor/Categoria (previsão agregada)
 - Base de Histórico (para lookup de dados do produto)
+- Input Comercial (ajustes % por Fornecedor/Cat3/Cat4 nos meses m1, m2, m3)
 
-O output contém 3 colunas de quantidade:
+O output contém 4 colunas de quantidade:
 - Qtd Bruta: Venda histórica real
 - Venda_Regular: Venda sem promoções (calculada usando % da Etapa 1)
-- Previsao_Vendas: Forecast distribuído por SKU
+- Previsao_Vendas: Forecast distribuído por SKU (modelo estatístico puro)
+- Previsao_Ajustada: Forecast com ajuste comercial aplicado
 
 Autor: Equipe Supply Chain
 Data: Janeiro/2026
-Versão: FINAL (Aba de Análise com m0, m1, m2, m3 e Trimestre Congelado)
+Versão: v2 (com colaboração comercial via ETAPA_5_INPUT_COMERCIAL)
 ================================================================================
 """
 
@@ -34,6 +36,9 @@ PATH_HISTORICO = r"\\files\Setores\SupplyChain\Forecast Fornecedores\2026\Teste 
 
 # Caminho do arquivo de mapeamento DE→PARA (substituição de códigos de produto)
 PATH_DE_PARA = r"\\files\Setores\SupplyChain\Forecast Fornecedores\2026\Teste Automatizado\FONTE_DE_PARA.xlsx"
+
+# >>> NOVO: Caminho do arquivo de input comercial (ajustes %)
+PATH_INPUT_COMERCIAL = r"\\files\Setores\SupplyChain\Forecast Fornecedores\2026\Teste Automatizado\ETAPA_5_INPUT_COMERCIAL.xlsx"
 
 # Caminho do arquivo de saída
 PATH_OUTPUT = r"\\files\Setores\SupplyChain\Forecast Fornecedores\2026\Teste Automatizado\ETAPA_3_PREVISAO_SKU.xlsx"
@@ -74,20 +79,16 @@ def aplicar_de_para(df, caminho_de_para):
         print("      ⚠ Tabela DE→PARA vazia. Seguindo sem substituição.")
         return df
 
-    # Garantir mesmo tipo de dado para o join
     df['codigo_produto'] = df['codigo_produto'].astype(str).str.strip()
     df_de_para['codigo_produto_DE'] = df_de_para['codigo_produto_DE'].astype(str).str.strip()
     df_de_para['codigo_produto_PARA'] = df_de_para['codigo_produto_PARA'].astype(str).str.strip()
 
-    # Criar dicionários de mapeamento
     mapa_codigo = dict(zip(df_de_para['codigo_produto_DE'], df_de_para['codigo_produto_PARA']))
     mapa_nome = dict(zip(df_de_para['codigo_produto_DE'], df_de_para['nome_produto_PARA']))
 
-    # Identificar registros afetados
     mascara = df['codigo_produto'].isin(mapa_codigo.keys())
     qtd_afetados = mascara.sum()
 
-    # Aplicar substituição de nome (antes de mudar o código) e depois código
     df.loc[mascara, 'nome produto'] = df.loc[mascara, 'codigo_produto'].map(mapa_nome)
     df.loc[mascara, 'codigo_produto'] = df.loc[mascara, 'codigo_produto'].map(mapa_codigo)
 
@@ -105,15 +106,12 @@ def carregar_dados():
     df_previsao = pd.read_excel(PATH_PREVISAO)
     df_historico = pd.read_excel(PATH_HISTORICO)
 
-    # 1. Limpar espaços invisíveis ocultos nas pontas dos nomes das colunas
     df_share.columns = df_share.columns.str.strip()
     df_previsao.columns = df_previsao.columns.str.strip()
     df_historico.columns = df_historico.columns.str.strip()
 
-    # 2. Aplicar mapeamento DE→PARA no histórico (antes de qualquer groupby)
     df_historico = aplicar_de_para(df_historico, PATH_DE_PARA)
 
-    # 3. Dicionário de Correção (De -> Para)
     mapa_correcao = {
         'Fornecedor Comercial': 'fornecedor comercial',
         'Fornecedor': 'fornecedor comercial',
@@ -139,10 +137,9 @@ def validar_arquivos(df_share, df_previsao, df_historico):
 
     erros = []
 
-    # Validar se as colunas essenciais existem antes de cruzar
     if 'fornecedor comercial' not in df_previsao.columns:
         erros.append("❌ ERRO: Coluna de Fornecedor não encontrada na base de Previsão!")
-        
+
     if 'fornecedor comercial' not in df_historico.columns:
         erros.append("❌ ERRO: Coluna de Fornecedor não encontrada na base de Histórico!")
 
@@ -153,11 +150,9 @@ def validar_arquivos(df_share, df_previsao, df_historico):
     if df_historico.shape[0] == 0:
         erros.append("❌ ERRO: Arquivo de HISTÓRICO está vazio")
 
-    # Se não deu erro de coluna, validar compatibilidade de fornecedores
     if not erros and df_share.shape[0] > 0 and df_previsao.shape[0] > 0:
         fornecedores_share = set(df_share['Fornecedor'].unique())
         fornecedores_previsao = set(df_previsao['fornecedor comercial'].unique())
-
         fornecedores_comuns = fornecedores_share.intersection(fornecedores_previsao)
 
         if len(fornecedores_comuns) == 0:
@@ -178,16 +173,13 @@ def validar_arquivos(df_share, df_previsao, df_historico):
 
 
 def calcular_venda_regular_historico(df_historico, df_previsao):
-    """
-    Calcula a Venda Regular no histórico usando o % de Venda Regular da Etapa 1.
-    """
+    """Calcula a Venda Regular no histórico usando o % de Venda Regular da Etapa 1."""
     print("\n[3] Calculando Venda Regular no histórico...")
 
-    # Calcular % Venda Regular por Categoria/Mês na Etapa 1
     df_previsao['Pct_Regular'] = np.where(
         df_previsao['Soma de Qtd Bruta'] > 0,
         df_previsao['Venda Regular'] / df_previsao['Soma de Qtd Bruta'],
-        1.0 
+        1.0
     )
 
     lookup_pct_regular = df_previsao[['fornecedor comercial', 'categoria', 'ano_mes', 'Pct_Regular']].copy()
@@ -206,6 +198,7 @@ def calcular_venda_regular_historico(df_historico, df_previsao):
 
     df_historico = df_historico.drop(columns=['categoria', 'Pct_Regular'], errors='ignore')
     df_historico['Previsao_Vendas'] = np.nan
+    df_historico['Previsao_Ajustada'] = np.nan  # >>> NOVO
 
     print(f"    ✓ Venda Regular calculada para {df_historico.shape[0]:,} linhas")
 
@@ -336,6 +329,175 @@ def concatenar_historico_forecast(df_historico, df_forecast, colunas_finais):
 
 
 # =============================================================================
+# >>> NOVO: FUNÇÃO DE AJUSTE COMERCIAL
+# =============================================================================
+
+def carregar_e_aplicar_ajuste_comercial(df_final):
+    """
+    Carrega o arquivo ETAPA_5_INPUT_COMERCIAL.xlsx e aplica os ajustes
+    percentuais nos meses m1, m2, m3 do forecast.
+
+    Lógica:
+    - m0 (primeiro mês de forecast): NÃO recebe ajuste (congelado)
+    - m1, m2, m3: Previsao_Ajustada = Previsao_Vendas × (1 + Ajuste%)
+    - m4 em diante: Previsao_Ajustada = Previsao_Vendas (sem ajuste)
+    - Histórico: Previsao_Ajustada permanece NaN
+    - SKUs sem match no input comercial: Previsao_Ajustada = Previsao_Vendas
+
+    O match é feito por: Fornecedor + Cat Nivel 3 + Cat Nivel 4
+    """
+    print("\n[10.5] Aplicando ajustes comerciais (ETAPA 5)...")
+
+    # -------------------------------------------------------------------------
+    # 1. Carregar arquivo de input comercial
+    # -------------------------------------------------------------------------
+    try:
+        df_input = pd.read_excel(PATH_INPUT_COMERCIAL)
+        df_input.columns = df_input.columns.str.strip()
+    except FileNotFoundError:
+        print("      ⚠ Arquivo ETAPA_5_INPUT_COMERCIAL não encontrado.")
+        print("      → Previsao_Ajustada será igual à Previsao_Vendas.")
+        df_final['Previsao_Ajustada'] = df_final['Previsao_Vendas']
+        return df_final
+    except Exception as e:
+        print(f"      ⚠ Erro ao ler input comercial: {e}")
+        df_final['Previsao_Ajustada'] = df_final['Previsao_Vendas']
+        return df_final
+
+    print(f"    - Input comercial: {df_input.shape[0]} linhas carregadas")
+
+    # -------------------------------------------------------------------------
+    # 2. Identificar meses m0, m1, m2, m3 do forecast
+    # -------------------------------------------------------------------------
+    df_fc = df_final[df_final['tipo'] == 'forecast'].copy()
+
+    if df_fc.empty:
+        print("      ⚠ Sem dados de forecast. Nenhum ajuste aplicado.")
+        df_final['Previsao_Ajustada'] = df_final['Previsao_Vendas']
+        return df_final
+
+    meses_forecast = sorted(df_fc['ano_mes'].unique())
+    print(f"    - Meses de forecast encontrados: {meses_forecast[:6]}{'...' if len(meses_forecast) > 6 else ''}")
+
+    # Mapear m0, m1, m2, m3 para os respectivos ano_mes
+    mapa_mes_ajuste = {}
+    if len(meses_forecast) >= 2:
+        mapa_mes_ajuste[meses_forecast[1]] = 'Ajuste % (mês 1)'
+    if len(meses_forecast) >= 3:
+        mapa_mes_ajuste[meses_forecast[2]] = 'Ajuste % (mês 2)'
+    if len(meses_forecast) >= 4:
+        mapa_mes_ajuste[meses_forecast[3]] = 'Ajuste % (mês 3)'
+
+    print(f"    - Mapeamento de ajustes:")
+    print(f"      m0 = {meses_forecast[0]} → SEM AJUSTE (congelado)")
+    for ano_mes, col_ajuste in mapa_mes_ajuste.items():
+        print(f"      {col_ajuste.replace('Ajuste % (', '').replace(')', '')} = {ano_mes} → {col_ajuste}")
+    if len(meses_forecast) > 4:
+        print(f"      m4+ = {meses_forecast[4]}... → SEM AJUSTE (mantém original)")
+
+    # -------------------------------------------------------------------------
+    # 3. Preparar lookup de ajustes (chave: Fornecedor + Cat3 + Cat4)
+    # -------------------------------------------------------------------------
+    colunas_ajuste = ['Fornecedor', 'Cat Nivel 3', 'Cat Nivel 4',
+                      'Ajuste % (mês 1)', 'Ajuste % (mês 2)', 'Ajuste % (mês 3)']
+
+    colunas_presentes = [c for c in colunas_ajuste if c in df_input.columns]
+    if len(colunas_presentes) < 4:  # Pelo menos chave + 1 coluna de ajuste
+        print("      ⚠ Colunas de ajuste não encontradas no input comercial.")
+        df_final['Previsao_Ajustada'] = df_final['Previsao_Vendas']
+        return df_final
+
+    df_ajustes = df_input[colunas_presentes].copy()
+
+    # Preencher NaN com 0 (sem ajuste)
+    for col in ['Ajuste % (mês 1)', 'Ajuste % (mês 2)', 'Ajuste % (mês 3)']:
+        if col in df_ajustes.columns:
+            df_ajustes[col] = pd.to_numeric(df_ajustes[col], errors='coerce').fillna(0)
+
+    # Padronizar strings para o match
+    df_ajustes['Fornecedor'] = df_ajustes['Fornecedor'].astype(str).str.strip().str.upper()
+    df_ajustes['Cat Nivel 3'] = df_ajustes['Cat Nivel 3'].astype(str).str.strip().str.upper()
+    df_ajustes['Cat Nivel 4'] = df_ajustes['Cat Nivel 4'].astype(str).str.strip().str.upper()
+
+    # -------------------------------------------------------------------------
+    # 4. Aplicar ajustes linha a linha no forecast
+    # -------------------------------------------------------------------------
+    # Criar colunas auxiliares padronizadas no df_final para match
+    df_final['_forn_upper'] = df_final['fornecedor comercial'].astype(str).str.strip().str.upper()
+    df_final['_cat3_upper'] = df_final['nome nível 3'].astype(str).str.strip().str.upper()
+    df_final['_cat4_upper'] = df_final['nome nível 4'].astype(str).str.strip().str.upper()
+
+    # Criar dicionário de ajustes indexado pela chave composta
+    dict_ajustes = {}
+    for _, row in df_ajustes.iterrows():
+        chave = (row['Fornecedor'], row['Cat Nivel 3'], row['Cat Nivel 4'])
+        dict_ajustes[chave] = {
+            'Ajuste % (mês 1)': row.get('Ajuste % (mês 1)', 0),
+            'Ajuste % (mês 2)': row.get('Ajuste % (mês 2)', 0),
+            'Ajuste % (mês 3)': row.get('Ajuste % (mês 3)', 0),
+        }
+
+    print(f"    - Chaves de ajuste carregadas: {len(dict_ajustes)}")
+
+    # Inicializar Previsao_Ajustada = Previsao_Vendas (default para tudo)
+    df_final['Previsao_Ajustada'] = df_final['Previsao_Vendas'].copy()
+
+    # Aplicar ajuste apenas nas linhas de forecast com match
+    contador_ajustados = 0
+    contador_sem_match = 0
+
+    for idx in df_final[df_final['tipo'] == 'forecast'].index:
+        ano_mes = df_final.at[idx, 'ano_mes']
+
+        # Verificar se este mês tem ajuste definido
+        if ano_mes not in mapa_mes_ajuste:
+            continue  # m0 ou m4+ → sem ajuste
+
+        col_ajuste = mapa_mes_ajuste[ano_mes]
+        chave = (
+            df_final.at[idx, '_forn_upper'],
+            df_final.at[idx, '_cat3_upper'],
+            df_final.at[idx, '_cat4_upper']
+        )
+
+        if chave in dict_ajustes:
+            pct_ajuste = dict_ajustes[chave].get(col_ajuste, 0)
+            if pct_ajuste != 0:
+                valor_original = df_final.at[idx, 'Previsao_Vendas']
+                if pd.notna(valor_original):
+                    df_final.at[idx, 'Previsao_Ajustada'] = round(valor_original * (1 + pct_ajuste))
+                    contador_ajustados += 1
+        else:
+            contador_sem_match += 1
+
+    # Limpar colunas auxiliares
+    df_final = df_final.drop(columns=['_forn_upper', '_cat3_upper', '_cat4_upper'])
+
+    # -------------------------------------------------------------------------
+    # 5. Relatório do ajuste
+    # -------------------------------------------------------------------------
+    total_forecast = (df_final['tipo'] == 'forecast').sum()
+    total_com_ajuste_potencial = sum(1 for m in meses_forecast[1:4] if m in mapa_mes_ajuste)
+
+    print(f"\n    ✓ RESUMO DO AJUSTE COMERCIAL:")
+    print(f"      - Total de linhas forecast: {total_forecast:,}")
+    print(f"      - Linhas efetivamente ajustadas (% ≠ 0): {contador_ajustados:,}")
+    print(f"      - Linhas sem match no input comercial: {contador_sem_match:,}")
+
+    # Mostrar resumo dos ajustes por chave
+    if dict_ajustes:
+        print(f"\n    📋 Ajustes configurados:")
+        for chave, vals in dict_ajustes.items():
+            ajustes_str = " | ".join([
+                f"{k.replace('Ajuste % (', '').replace(')', '')}: {v:+.1%}"
+                for k, v in vals.items()
+            ])
+            print(f"      {chave[0]} / {chave[1]} / {chave[2]} → {ajustes_str}")
+
+    return df_final
+
+
+# =============================================================================
 # FUNÇÃO PARA GERAR ABA DE ANÁLISE POR CATEGORIA NÍVEL 4
 # =============================================================================
 
@@ -345,6 +507,7 @@ def criar_aba_analise_categoria(df_final):
     - Previsão dos próximos 4 meses (m0, m1, m2, m3)
     - Variação vs ano anterior (LY) e mês anterior (LM)
     - Comparativo de trimestres (apenas m0, m1 e m2)
+    - >>> NOVO: Usa Previsao_Ajustada no forecast
     """
     print("\n[11] Criando aba de análise por Categoria Nível 4...")
 
@@ -357,15 +520,14 @@ def criar_aba_analise_categoria(df_final):
 
     meses_forecast = sorted(df_fc['ano_mes'].unique())
 
-    # Agora exigimos pelo menos 4 meses de forecast para conseguir criar o m3
     if len(meses_forecast) < 4:
         print("    ⚠️ Forecast insuficiente (precisa de pelo menos 4 meses)")
         return pd.DataFrame()
 
-    m0 = meses_forecast[0]  
-    m1 = meses_forecast[1]  
-    m2 = meses_forecast[2]  
-    m3 = meses_forecast[3]  # Novo mês adicionado
+    m0 = meses_forecast[0]
+    m1 = meses_forecast[1]
+    m2 = meses_forecast[2]
+    m3 = meses_forecast[3]
 
     def get_mes_ly(ano_mes):
         ano, mes = ano_mes.split('_')
@@ -378,20 +540,18 @@ def criar_aba_analise_categoria(df_final):
         else:
             return f"{ano}_{str(mes - 1).zfill(2)}"
 
-    # Meses do ano anterior
     m0_ly = get_mes_ly(m0)
     m1_ly = get_mes_ly(m1)
     m2_ly = get_mes_ly(m2)
     m3_ly = get_mes_ly(m3)
-
     m0_lm = get_mes_anterior(m0)
 
-    # Agregar vendas 
+    # >>> MODIFICADO: Usar Previsao_Ajustada ao invés de Previsao_Vendas
     vendas_hist = df_hist.groupby(['nome nível 3', 'nome nível 4', 'ano_mes'])['Qtd Bruta'].sum().reset_index()
     vendas_hist_pivot = vendas_hist.pivot(index=['nome nível 3', 'nome nível 4'], columns='ano_mes', values='Qtd Bruta').fillna(0)
 
-    vendas_fc = df_fc.groupby(['nome nível 3', 'nome nível 4', 'ano_mes'])['Previsao_Vendas'].sum().reset_index()
-    vendas_fc_pivot = vendas_fc.pivot(index=['nome nível 3', 'nome nível 4'], columns='ano_mes', values='Previsao_Vendas').fillna(0)
+    vendas_fc = df_fc.groupby(['nome nível 3', 'nome nível 4', 'ano_mes'])['Previsao_Ajustada'].sum().reset_index()
+    vendas_fc_pivot = vendas_fc.pivot(index=['nome nível 3', 'nome nível 4'], columns='ano_mes', values='Previsao_Ajustada').fillna(0)
 
     meses_hist = sorted(df_hist['ano_mes'].unique(), reverse=True)
     ultimo_tri_meses = meses_hist[0:3] if len(meses_hist) >= 3 else []
@@ -403,10 +563,7 @@ def criar_aba_analise_categoria(df_final):
         cat3 = cat_row['nome nível 3']
         cat4 = cat_row['nome nível 4']
 
-        row = {
-            'Cat Nivel 3': cat3,
-            'Cat Nivel 4': cat4
-        }
+        row = {'Cat Nivel 3': cat3, 'Cat Nivel 4': cat4}
 
         def get_hist(mes):
             if mes in vendas_hist_pivot.columns and (cat3, cat4) in vendas_hist_pivot.index:
@@ -427,33 +584,31 @@ def criar_aba_analise_categoria(df_final):
         val_m1_ly = get_hist(m1_ly)
         val_m2_ly = get_hist(m2_ly)
         val_m3_ly = get_hist(m3_ly)
-
         val_m0_lm = get_hist(m0_lm)
 
         # Mês 0
         row['mês 0'] = val_m0
         row['% Var LY'] = ((val_m0 / val_m0_ly) - 1) if val_m0_ly > 0 else None
-        row['% Var LM'] = ((val_m0 / val_m0_lm) - 1) if val_m0_lm > 0 else None  
+        row['% Var LM'] = ((val_m0 / val_m0_lm) - 1) if val_m0_lm > 0 else None
 
         # Mês 1
         row['mês 1'] = val_m1
         row['% Var LY_1'] = ((val_m1 / val_m1_ly) - 1) if val_m1_ly > 0 else None
-        row['% Var LM_1'] = ((val_m1 / val_m0) - 1) if val_m0 > 0 else None  
+        row['% Var LM_1'] = ((val_m1 / val_m0) - 1) if val_m0 > 0 else None
 
         # Mês 2
         row['mês 2'] = val_m2
         row['% Var LY_2'] = ((val_m2 / val_m2_ly) - 1) if val_m2_ly > 0 else None
-        row['% Var LM_2'] = ((val_m2 / val_m1) - 1) if val_m1 > 0 else None  
-        
-        # Mês 3 (Novo)
+        row['% Var LM_2'] = ((val_m2 / val_m1) - 1) if val_m1 > 0 else None
+
+        # Mês 3
         row['mês 3'] = val_m3
         row['% Var LY_3'] = ((val_m3 / val_m3_ly) - 1) if val_m3_ly > 0 else None
         row['% Var LM_3'] = ((val_m3 / val_m2) - 1) if val_m2 > 0 else None
 
-        # Trimestres (Ficam congelados apenas com m0, m1 e m2)
-        tri_atual = val_m0 + val_m1 + val_m2  
-        tri_ly = val_m0_ly + val_m1_ly + val_m2_ly  
-
+        # Trimestres (m0 + m1 + m2)
+        tri_atual = val_m0 + val_m1 + val_m2
+        tri_ly = val_m0_ly + val_m1_ly + val_m2_ly
         tri_ultimo = sum([get_hist(m) for m in ultimo_tri_meses]) if ultimo_tri_meses else 0
 
         row['Trimestre ano anterior'] = tri_ly
@@ -466,8 +621,6 @@ def criar_aba_analise_categoria(df_final):
         resultado.append(row)
 
     df_analise = pd.DataFrame(resultado)
-
-    # Ordenar por Cat Nivel 3 e Trimestre atual (maior primeiro)
     df_analise = df_analise.sort_values(['Cat Nivel 3', 'Trimestre atual (m0/m1/m2)'], ascending=[True, False])
 
     print(f"    ✓ Análise criada: {len(df_analise)} categorias")
@@ -491,32 +644,27 @@ def salvar_resultado_com_analise(df_final, df_analise, path_output):
             workbook = writer.book
             ws = writer.sheets['Analise_Categoria']
 
-            # Definir cores
             amarelo = PatternFill(start_color='FFFF99', end_color='FFFF99', fill_type='solid')
             verde = PatternFill(start_color='C6EFCE', end_color='C6EFCE', fill_type='solid')
             azul = PatternFill(start_color='BDD7EE', end_color='BDD7EE', fill_type='solid')
             header_fill = PatternFill(start_color='D9D9D9', end_color='D9D9D9', fill_type='solid')
             header_font = Font(bold=True)
 
-            # Adicionado o 'mês 3' e suas variações nas listas de formatação
             colunas_amarelo = ['mês 0', 'mês 1', 'mês 2', 'mês 3', 'Trimestre ano anterior', 'Ultimo Trimestre', 'Trimestre atual (m0/m1/m2)']
             colunas_verde = ['% Var LM', '% Var LM_1', '% Var LM_2', '% Var LM_3']
             colunas_azul = ['% var TRI atual vs LY', '% var TRI atual vs ultimo TRI']
             colunas_percentual = ['% Var LY', '% Var LM', '% Var LY_1', '% Var LM_1', '% Var LY_2', '% Var LM_2', '% Var LY_3', '% Var LM_3', '% var TRI atual vs LY', '% var TRI atual vs ultimo TRI']
             colunas_numero = ['mês 0', 'mês 1', 'mês 2', 'mês 3', 'Trimestre ano anterior', 'Ultimo Trimestre', 'Trimestre atual (m0/m1/m2)']
 
-            # Formatar cabeçalho
             for col_idx in range(1, len(df_analise.columns) + 1):
                 cell = ws.cell(row=1, column=col_idx)
                 cell.fill = header_fill
                 cell.font = header_font
                 cell.alignment = Alignment(horizontal='center', wrap_text=True)
 
-            # Aplicar formatação por coluna
             for col_idx, col_name in enumerate(df_analise.columns, 1):
                 col_letter = get_column_letter(col_idx)
 
-                # Definir largura da coluna
                 if col_name == 'Cat Nivel 4':
                     ws.column_dimensions[col_letter].width = 22
                 elif col_name == 'Comentarios':
@@ -526,11 +674,9 @@ def salvar_resultado_com_analise(df_final, df_analise, path_output):
                 else:
                     ws.column_dimensions[col_letter].width = 14
 
-                # Aplicar formatação nas células de dados
                 for row_idx in range(2, len(df_analise) + 2):
                     cell = ws.cell(row=row_idx, column=col_idx)
 
-                    # Aplicar cores
                     if col_name in colunas_amarelo:
                         cell.fill = amarelo
                     elif col_name in colunas_verde:
@@ -538,24 +684,20 @@ def salvar_resultado_com_analise(df_final, df_analise, path_output):
                     elif col_name in colunas_azul:
                         cell.fill = azul
 
-                    # Formatar números (sem decimais)
                     if col_name in colunas_numero:
                         cell.number_format = '#,##0'
-
-                    # Formatar percentuais (1 casa decimal)
                     if col_name in colunas_percentual:
                         cell.number_format = '0.0%'
 
-                    # Centralizar valores
                     if col_name != 'Cat Nivel 4' and col_name != 'Comentarios':
                         cell.alignment = Alignment(horizontal='center')
 
-            # Congelar cabeçalho
             ws.freeze_panes = 'B2'
 
     print(f"    ✓ Arquivo salvo: {path_output}")
-    print(f"    ✓ Aba 1: Previsao_SKU")
-    print(f"    ✓ Aba 2: Analise_Categoria (formatada)")
+    print(f"    ✓ Aba 1: Previsao_SKU (com Previsao_Ajustada)")
+    print(f"    ✓ Aba 2: Analise_Categoria (usando valores ajustados)")
+
 
 # =============================================================================
 # EXECUÇÃO PRINCIPAL
@@ -563,7 +705,7 @@ def salvar_resultado_com_analise(df_final, df_analise, path_output):
 
 def main():
     print("=" * 70)
-    print("ETAPA 3 - PREVISÃO DE VENDAS POR SKU (VERSÃO FINAL)")
+    print("ETAPA 3 - PREVISÃO DE VENDAS POR SKU (v2 - COM AJUSTE COMERCIAL)")
     print("=" * 70)
 
     mes_texto_para_numero, mes_numero_para_texto = criar_mapeamento_meses()
@@ -587,15 +729,22 @@ def main():
     df_forecast = adicionar_dados_produto(df_forecast, df_lookup)
     df_forecast = montar_estrutura_forecast(df_forecast, df_historico, mes_numero_para_texto, df_situacao)
 
+    # >>> NOVO: Inicializar Previsao_Ajustada no forecast (antes da concatenação)
+    df_forecast['Previsao_Ajustada'] = df_forecast['Previsao_Vendas'].copy()
+
     colunas_finais = [
         'codigo_deposito_pd', 'codigo_produto', 'nome produto',
         'fornecedor comercial', 'nome nível 3', 'nome nível 4',
-        'data', 'ano_mes', 'Qtd Bruta', 'Venda_Regular', 'Previsao_Vendas',
+        'data', 'ano_mes', 'Qtd Bruta', 'Venda_Regular',
+        'Previsao_Vendas', 'Previsao_Ajustada',  # >>> NOVO
         'tipo', 'ano', 'mes', 'comprado', 'situacao'
     ]
 
     colunas_finais = [col for col in colunas_finais if col in df_historico.columns or col in df_forecast.columns]
     df_final = concatenar_historico_forecast(df_historico, df_forecast, colunas_finais)
+
+    # >>> NOVO: Aplicar ajuste comercial após concatenação
+    df_final = carregar_e_aplicar_ajuste_comercial(df_final)
 
     df_analise = criar_aba_analise_categoria(df_final)
     salvar_resultado_com_analise(df_final, df_analise, PATH_OUTPUT)
