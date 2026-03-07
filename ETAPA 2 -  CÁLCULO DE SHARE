@@ -97,22 +97,28 @@ def aplicar_de_para(df, caminho_de_para):
         print("  ⚠ Tabela DE→PARA vazia. Seguindo sem substituição.\n")
         return df
 
-    # Garantir mesmo tipo de dado para o join
+    # Salvar tipo original para restaurar depois
+    tipo_original = df['codigo_produto'].dtype
+
+    # Garantir mesmo tipo de dado para o mapeamento
     df['codigo_produto'] = df['codigo_produto'].astype(str).str.strip()
-    df_de_para['codigo_DE'] = df_de_para['codigo_DE'].astype(str).str.strip()
-    df_de_para['codigo_PARA'] = df_de_para['codigo_PARA'].astype(str).str.strip()
+    df_de_para['codigo_produto_DE'] = df_de_para['codigo_produto_DE'].astype(str).str.strip()
+    df_de_para['codigo_produto_PARA'] = df_de_para['codigo_produto_PARA'].astype(str).str.strip()
 
     # Criar dicionários de mapeamento
-    mapa_codigo = dict(zip(df_de_para['codigo_DE'], df_de_para['codigo_PARA']))
-    mapa_nome = dict(zip(df_de_para['codigo_DE'], df_de_para['nome_produto_PARA']))
+    mapa_codigo = dict(zip(df_de_para['codigo_produto_DE'], df_de_para['codigo_produto_PARA']))
+    mapa_nome = dict(zip(df_de_para['codigo_produto_DE'], df_de_para['nome_produto_PARA']))
 
     # Identificar registros afetados
     mascara = df['codigo_produto'].isin(mapa_codigo.keys())
     qtd_afetados = mascara.sum()
 
-    # Aplicar substituição de código e nome
+    # Aplicar substituição de nome (antes de mudar o código) e depois código
     df.loc[mascara, 'nome produto'] = df.loc[mascara, 'codigo_produto'].map(mapa_nome)
     df.loc[mascara, 'codigo_produto'] = df.loc[mascara, 'codigo_produto'].map(mapa_codigo)
+
+    # Restaurar tipo original de codigo_produto
+    df['codigo_produto'] = df['codigo_produto'].astype(tipo_original)
 
     print(f"  ✓ Mapeamentos carregados: {len(mapa_codigo)}")
     print(f"  ✓ Registros substituídos: {qtd_afetados:,}\n")
