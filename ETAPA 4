@@ -19,6 +19,14 @@ REGRA DE CHEGADA E CALENDÁRIO:
 - Mês 1 em diante: Data de Pedido = 1º dia do mês.
 - Data Chegada = Data do Pedido + LT dias.
 
+-----------------------------------------------------------------------------
+CHANGELOG v2.1:
+-----------------------------------------------------------------------------
+- Sell-out do forecast agora usa coluna 'Previsao_Ajustada' (com ajuste
+  comercial da ETAPA 5) em vez de 'Previsao_Vendas' (modelo puro).
+- Fallback automático para 'Previsao_Vendas' caso 'Previsao_Ajustada'
+  não exista na base (compatibilidade retroativa).
+
 ================================================================================
 """
 
@@ -43,7 +51,7 @@ except ImportError:
 
 
 # =============================================================================
-# CONFIGURAÇÃO DE LOGGING [Melhoria 6.2]
+# CONFIGURAÇÃO DE LOGGING
 # =============================================================================
 def configurar_logging(log_dir: str = None) -> logging.Logger:
     """
@@ -102,7 +110,13 @@ PATH_OUTPUT = r"\\files\Setores\SupplyChain\Forecast Fornecedores\2026\Teste Aut
 # ---------- Parâmetros de cálculo ----------
 HORIZONTE_MESES = 13              # Mês atual + 12 meses futuros
 DATA_REFERENCIA = datetime.now()  # Data de execução do script
-DIAS_COBERTURA_MIN = 7            # [Melhoria 3.2] Floor mínimo de cobertura
+DIAS_COBERTURA_MIN = 7            # Floor mínimo de cobertura
+
+# ---------- Coluna de demanda (forecast) ----------
+# A ETAPA 4 usa a previsão ajustada pelo comercial como fonte de sell-out.
+# Se a coluna não existir (base gerada antes da v3), faz fallback para Previsao_Vendas.
+COLUNA_PREVISAO = 'Previsao_Ajustada'
+COLUNA_PREVISAO_FALLBACK = 'Previsao_Vendas'
 
 
 # =============================================================================
@@ -111,7 +125,7 @@ DIAS_COBERTURA_MIN = 7            # [Melhoria 3.2] Floor mínimo de cobertura
 
 def dias_reais_no_mes(ano: int, mes: int) -> int:
     """
-    [Melhoria 1.1] Retorna a quantidade real de dias em um mês específico.
+    Retorna a quantidade real de dias em um mês específico.
 
     Usa calendar.monthrange() que considera anos bissextos automaticamente.
     Substitui a constante DIAS_MES=30 que gerava distorções em fev (28/29)
@@ -176,7 +190,7 @@ def gerar_lista_meses(data_ref: datetime, horizonte: int) -> list:
 
 def construir_vetor_dias_reais(meses_lista: list) -> np.ndarray:
     """
-    [Melhoria 1.1] Constrói vetor com os dias reais de cada mês do horizonte.
+    Constrói vetor com os dias reais de cada mês do horizonte.
 
     Em vez de usar DIAS_MES=30 fixo para todos os meses, este vetor contém
     o número real de dias (28-31) para cada posição do horizonte.
@@ -213,7 +227,7 @@ def calcular_mes_chegada(data_pedido: datetime, lt_dias: int) -> str:
 def precomputar_chegadas(data_ref: datetime, horizonte: int, lts_unicos: np.ndarray,
                          meses_ext_idx: dict) -> dict:
     """
-    [Melhoria 2.2] Pré-calcula o índice de chegada para cada combinação (mês_pedido, LT).
+    Pré-calcula o índice de chegada para cada combinação (mês_pedido, LT).
 
     Em vez de calcular o mês de chegada dentro do loop por SKU (que repete
     o mesmo cálculo para SKUs com mesmo LT), esta função computa uma única
@@ -276,7 +290,7 @@ def safe_numeric(val, default: float = 0.0) -> float:
 
 def calcular_cobertura_dias(estoque: float, demanda_diaria: float) -> float:
     """
-    [Melhoria 5.1] Calcula a cobertura em dias do estoque projetado.
+    Calcula a cobertura em dias do estoque projetado.
 
     Métrica fundamental no S&OP que responde: "quantos dias de venda
     o estoque atual consegue cobrir?"
@@ -296,12 +310,12 @@ def calcular_cobertura_dias(estoque: float, demanda_diaria: float) -> float:
 
 
 # =============================================================================
-# TESTES UNITÁRIOS [Melhoria 6.3]
+# TESTES UNITÁRIOS
 # =============================================================================
 
 def executar_testes(logger: logging.Logger) -> bool:
     """
-    [Melhoria 6.3] Executa testes unitários das funções auxiliares.
+    Executa testes unitários das funções auxiliares.
 
     Testes automatizados garantem que mudanças futuras no código não
     quebrem a lógica base. Cada teste valida uma função específica
@@ -391,15 +405,15 @@ def executar_testes(logger: logging.Logger) -> bool:
 # =============================================================================
 
 def main():
-    logger = configurar_logging(log_dir="/home/claude")
+    logger = configurar_logging()
 
     logger.info("=" * 70)
     logger.info("ETAPA 4 - CÁLCULO DE NECESSIDADE DE COMPRA (PEDIDO)")
-    logger.info("VERSÃO: OTIMIZADA v2 — Robustez + Performance + Governança")
+    logger.info("VERSÃO: v2.1 — Usando Previsao_Ajustada (ajuste comercial)")
     logger.info("=" * 70)
 
     # -------------------------------------------------------------------------
-    # 0. TESTES UNITÁRIOS [Melhoria 6.3]
+    # 0. TESTES UNITÁRIOS
     # -------------------------------------------------------------------------
     if not executar_testes(logger):
         logger.critical("Testes falharam — abortando execução.")
@@ -422,12 +436,33 @@ def main():
     logger.info(f"    Estoque:      {df_estoque.shape[0]:,} linhas")
 
     # -------------------------------------------------------------------------
+    # 1.1 SELECIONAR COLUNA DE PREVISÃO (Ajustada > Vendas)
+    # -------------------------------------------------------------------------
+    coluna_usada = COLUNA_PREVISAO
+    if COLUNA_PREVISAO not in df_previsao.columns:
+        if COLUNA_PREVISAO_FALLBACK in df_previsao.columns:
+            coluna_usada = COLUNA_PREVISAO_FALLBACK
+            logger.warning(
+                f"    [Fallback] Coluna '{COLUNA_PREVISAO}' não encontrada. "
+                f"Usando '{COLUNA_PREVISAO_FALLBACK}' como fonte de demanda."
+            )
+        else:
+            logger.critical(
+                f"Nenhuma coluna de previsão encontrada! "
+                f"Esperado: '{COLUNA_PREVISAO}' ou '{COLUNA_PREVISAO_FALLBACK}'. "
+                f"Colunas disponíveis: {df_previsao.columns.tolist()}"
+            )
+            return
+    else:
+        logger.info(f"    ✓ Usando coluna '{coluna_usada}' como fonte de demanda (sell-out)")
+
+    # -------------------------------------------------------------------------
     # 2. PREPARAR PARÂMETROS TEMPORAIS
     # -------------------------------------------------------------------------
     meses_horizonte = gerar_lista_meses(DATA_REFERENCIA, HORIZONTE_MESES)
     meses_horizonte_ext = gerar_lista_meses(DATA_REFERENCIA, HORIZONTE_MESES + 6)
 
-    # [Melhoria 1.1] Vetor de dias reais por mês (substitui DIAS_MES=30)
+    # Vetor de dias reais por mês (substitui DIAS_MES=30)
     dias_reais_ext = construir_vetor_dias_reais(meses_horizonte_ext)
 
     dias_restantes, dias_total = calcular_dias_restantes_mes(DATA_REFERENCIA)
@@ -453,23 +488,23 @@ def main():
         if col in df_estoque.columns:
             df_estoque[col] = df_estoque[col].apply(safe_numeric)
 
-    # [Melhoria 3.2] Garantir cobertura mínima de 7 dias
+    # Garantir cobertura mínima de 7 dias
     df_estoque['_dias_cobertura_raw'] = df_estoque['LT'] + df_estoque['FREQUENCIA'] + df_estoque['EST_SEGURANCA']
     qtd_abaixo_floor = (df_estoque['_dias_cobertura_raw'] < DIAS_COBERTURA_MIN).sum()
     if qtd_abaixo_floor > 0:
         logger.warning(
-            f"    [Governança 3.2] {qtd_abaixo_floor} SKUs com dias_cobertura < {DIAS_COBERTURA_MIN}. "
+            f"    [Governança] {qtd_abaixo_floor} SKUs com dias_cobertura < {DIAS_COBERTURA_MIN}. "
             f"Aplicando floor mínimo."
         )
     df_estoque.drop(columns=['_dias_cobertura_raw'], inplace=True)
 
-    # Pivotar previsão
+    # Pivotar previsão — USANDO A COLUNA CORRETA (Previsao_Ajustada)
     meses_necessarios = set(meses_horizonte_ext)
     df_prev_filtrado = df_previsao[df_previsao['ano_mes'].isin(meses_necessarios)]
 
     df_pivot = df_prev_filtrado.pivot_table(
         index=['codigo_deposito_pd', 'codigo_produto'],
-        columns='ano_mes', values='Previsao_Vendas', aggfunc='sum', fill_value=0
+        columns='ano_mes', values=coluna_usada, aggfunc='sum', fill_value=0
     ).reset_index()
 
     df_cadastro = df_previsao.groupby(['codigo_deposito_pd', 'codigo_produto']).agg({
@@ -479,7 +514,7 @@ def main():
 
     df_pivot = df_pivot.merge(df_cadastro, on=['codigo_deposito_pd', 'codigo_produto'], how='left')
 
-    # --- [Melhoria 3.1] Validação do merge — detectar SKUs perdidos ---
+    # --- Validação do merge — detectar SKUs perdidos ---
     chaves_previsao = set(
         zip(df_pivot['codigo_deposito_pd'], df_pivot['codigo_produto'])
     )
@@ -492,9 +527,8 @@ def main():
 
     if skus_sem_estoque:
         logger.warning(
-            f"    [Validação 3.1] {len(skus_sem_estoque)} SKUs na PREVISÃO sem dados de ESTOQUE (serão ignorados)."
+            f"    [Validação] {len(skus_sem_estoque)} SKUs na PREVISÃO sem dados de ESTOQUE (serão ignorados)."
         )
-        # Log detalhado no arquivo (DEBUG)
         for cd, prod in sorted(list(skus_sem_estoque))[:20]:
             logger.debug(f"      Sem estoque: CD={cd}, Produto={prod}")
         if len(skus_sem_estoque) > 20:
@@ -502,7 +536,7 @@ def main():
 
     if skus_sem_previsao:
         logger.warning(
-            f"    [Validação 3.1] {len(skus_sem_previsao)} SKUs no ESTOQUE sem PREVISÃO (sem demanda futura)."
+            f"    [Validação] {len(skus_sem_previsao)} SKUs no ESTOQUE sem PREVISÃO (sem demanda futura)."
         )
 
     df = df_pivot.merge(
@@ -519,7 +553,7 @@ def main():
         return
 
     # -------------------------------------------------------------------------
-    # 4. PRÉ-CÁLCULO DE CALENDÁRIO [Melhoria 2.2]
+    # 4. PRÉ-CÁLCULO DE CALENDÁRIO
     # -------------------------------------------------------------------------
     meses_ext_idx = {m: i for i, m in enumerate(meses_horizonte_ext)}
 
@@ -534,7 +568,7 @@ def main():
     linhas_output = []
     n_ext = len(meses_horizonte_ext)
 
-    # Contadores de governança [Melhoria 3.3]
+    # Contadores de governança
     total_rupturas = 0
     skus_com_ruptura = set()
     total_floor_aplicado = 0
@@ -542,7 +576,7 @@ def main():
     # -------------------------------------------------------------------------
     # 5. CALCULAR NECESSIDADE DE COMPRA (DRP CONTÍNUO E FORWARD-LOOKING)
     # -------------------------------------------------------------------------
-    logger.info("[5] Calculando simulação DRP Mês a Mês...")
+    logger.info(f"[5] Calculando simulação DRP Mês a Mês (demanda via '{coluna_usada}')...")
 
     for row in tqdm(df_records, desc="Processando SKUs"):
         cadastro = {
@@ -571,14 +605,14 @@ def main():
 
         estoque_inicial = estoque_atual + pendencia + nna
 
-        # [Melhoria 3.2] Floor mínimo de cobertura
+        # Floor mínimo de cobertura
         dias_cobertura = lt + frequencia + est_seguranca
         if dias_cobertura < DIAS_COBERTURA_MIN:
             dias_cobertura = DIAS_COBERTURA_MIN
             total_floor_aplicado += 1
 
         # -----------------------------------------------------------------
-        # [Melhoria 2.1] Vetorização do cálculo de sell_out e est_obj
+        # Vetorização do cálculo de sell_out e est_obj
         # -----------------------------------------------------------------
         # Sell out vetorizado
         sell_out_vec = np.zeros(n_ext)
@@ -587,7 +621,7 @@ def main():
         # Mês 0: proporcionalizar pelos dias restantes
         sell_out_vec[0] *= proporcao_mes_atual
 
-        # [Melhoria 1.1] EST_OBJ com dias reais por mês
+        # EST_OBJ com dias reais por mês
         est_obj_vec = np.zeros(n_ext)
         for i in range(n_ext):
             dias_rest = dias_cobertura
@@ -595,7 +629,7 @@ def main():
 
             for j in range(i, n_ext):
                 demanda_futura = safe_numeric(row.get(meses_horizonte_ext[j], 0))
-                dias_mes_j = dias_reais_ext[j]  # [1.1] Dias reais em vez de 30
+                dias_mes_j = dias_reais_ext[j]
 
                 if dias_rest >= dias_mes_j:
                     demanda_forward += demanda_futura
@@ -615,16 +649,13 @@ def main():
             est_obj_vec[i] = demanda_forward
 
         # -----------------------------------------------------------------
-        # [Melhoria 2.2] Usar tabela pré-computada de chegadas
+        # Usar tabela pré-computada de chegadas
         # -----------------------------------------------------------------
         idx_chegada_por_t = tabela_chegada[lt]
 
         # -----------------------------------------------------------------
-        # [Melhoria 1.3] Simulação DRP com cobertura de meses intermediários
+        # Simulação DRP com cobertura de meses intermediários
         # -----------------------------------------------------------------
-        # A melhoria aqui é garantir que, para LTs longos onde o pedido t
-        # chega muitos meses à frente, TODOS os meses entre a chegada de t
-        # e a chegada de t+1 sejam verificados para atender EST_OBJ.
         pedidos = [0.0] * HORIZONTE_MESES
         entradas = np.zeros(n_ext)
 
@@ -635,7 +666,6 @@ def main():
                 continue
 
             # Definir o range de meses que este pedido precisa cobrir
-            # [1.3] Cobrir desde idx_atual até (idx_prox - 1)
             if t + 1 < HORIZONTE_MESES:
                 idx_prox = idx_chegada_por_t[t + 1]
             else:
@@ -650,7 +680,7 @@ def main():
                 if k >= n_ext:
                     continue
 
-                # Estoque projetado acumulado até k, incluindo necessidade parcial deste pedido
+                # Estoque projetado acumulado até k
                 proj_inv_k = (estoque_inicial
                               + np.sum(entradas[:k + 1])
                               - np.sum(sell_out_vec[:k + 1])
@@ -675,12 +705,12 @@ def main():
             entrada_mes = entradas[t]
             est_proj = estoque_simul + entrada_mes - sell_out
 
-            # [Melhoria 5.1] Cobertura em dias
+            # Cobertura em dias
             dias_mes_t = dias_reais_ext[t]
             demanda_diaria_t = sell_out / dias_mes_t if dias_mes_t > 0 else 0
             cobertura = calcular_cobertura_dias(est_proj, demanda_diaria_t)
 
-            # [Melhoria 3.3] Flag de ruptura
+            # Flag de ruptura
             alerta_ruptura = "SIM" if est_proj < 0 else ""
             if est_proj < 0:
                 total_rupturas += 1
@@ -694,8 +724,8 @@ def main():
                 'ESTOQUE_OBJETIVO': round(est_obj_vec[t], 0),
                 'PEDIDO': round(pedidos[t], 0),
                 'ENTRADA': round(entrada_mes, 0),
-                'COBERTURA_DIAS': cobertura,        # [5.1]
-                'ALERTA_RUPTURA': alerta_ruptura,    # [3.3]
+                'COBERTURA_DIAS': cobertura,
+                'ALERTA_RUPTURA': alerta_ruptura,
             })
             linhas_output.append(linha)
             estoque_simul = est_proj
@@ -705,6 +735,7 @@ def main():
     # -------------------------------------------------------------------------
     logger.info("-" * 50)
     logger.info("RELATÓRIO DE GOVERNANÇA:")
+    logger.info(f"    Coluna de demanda utilizada: {coluna_usada}")
     logger.info(f"    SKUs processados: {len(df_records):,}")
     logger.info(f"    Meses com ruptura projetada: {total_rupturas}")
     logger.info(f"    SKUs com pelo menos 1 ruptura: {len(skus_com_ruptura)}")
@@ -763,7 +794,7 @@ def main():
         # Formatação das células
         for row in worksheet.iter_rows(min_row=2, max_row=worksheet.max_row,
                                         min_col=1, max_col=worksheet.max_column):
-            # [Melhoria 3.3] Destacar linhas com ruptura
+            # Destacar linhas com ruptura
             is_ruptura = False
             if alerta_col_idx:
                 alerta_cell = row[alerta_col_idx - 1]
