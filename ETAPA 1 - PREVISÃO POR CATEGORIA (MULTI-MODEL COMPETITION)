@@ -971,8 +971,90 @@ def _is_forecast_flat(y_series: np.ndarray, forecast: np.ndarray) -> Tuple[bool,
         is_flat = True
         variacao_ondas = 0.0
 
+    # ---------------------------------------------------------------
+    # GOVERNANÇA EXTRA: VERIFICAÇÃO POR JANELA DE 12 MESES
+    # Em horizontes longos (ex: 24 meses), modelos convergem para um
+    # valor constante na segunda metade. Verificamos cada bloco de 12
+    # meses individualmente para capturar flatness parcial.
+    # ---------------------------------------------------------------
+    if not is_flat and len(forecast) > CONFIG.seasonal_period:
+        for start in range(0, len(forecast), CONFIG.seasonal_period):
+            bloco = forecast[start:start + CONFIG.seasonal_period]
+            if len(bloco) >= 6:
+                media_bloco = np.mean(bloco)
+                if media_bloco > 0:
+                    diffs_bloco = np.diff(bloco)
+                    var_bloco = np.std(diffs_bloco) / media_bloco
+                    if var_bloco < 0.015:
+                        is_flat = True
+                        variacao_ondas = min(variacao_ondas, var_bloco)
+                        break
+
     rejeitado = is_flat and cv_hist > 0.10
     return rejeitado, variacao_ondas
+
+
+def _apply_seasonal_indices(y_series: np.ndarray, forecast: np.ndarray,
+                            dates: Optional[pd.DatetimeIndex] = None) -> np.ndarray:
+    """
+    Aplica índices sazonais do histórico a uma previsão chapada (flat).
+    Preserva o nível médio da previsão, mas injeta a oscilação sazonal
+    observada nos dados históricos.
+
+    Os índices são calculados por posição do mês (1-12) para alinhar
+    corretamente com o calendário, independente do mês de início do histórico.
+    """
+    sp = CONFIG.seasonal_period
+
+    if len(y_series) < sp:
+        return forecast
+
+    # Calcula índices sazonais por mês do calendário (1-12)
+    if dates is not None and len(dates) == len(y_series):
+        df_tmp = pd.DataFrame({'y': y_series, 'month': pd.to_datetime(dates).month})
+        media_por_mes_cal = df_tmp.groupby('month')['y'].mean()
+        media_geral = media_por_mes_cal.mean()
+
+        if media_geral <= 0 or len(media_por_mes_cal) < 6:
+            return forecast
+
+        # Índice sazonal por mês do calendário (1-12)
+        indices_dict = (media_por_mes_cal / media_geral).to_dict()
+
+        # Determina o mês inicial da previsão (mês seguinte ao último dado)
+        ultimo_mes = pd.to_datetime(dates[-1]).month
+        mes_inicio_forecast = (ultimo_mes % 12) + 1  # próximo mês
+
+        forecast_corrigido = np.copy(forecast).astype(float)
+        for i in range(len(forecast)):
+            mes_atual = ((mes_inicio_forecast - 1 + i) % 12) + 1  # 1-12
+            idx_sazonal = indices_dict.get(mes_atual, 1.0)
+            forecast_corrigido[i] = forecast[i] * idx_sazonal
+    else:
+        # Fallback: usa blocos posicionais quando datas não estão disponíveis
+        n_ciclos = len(y_series) // sp
+        ultimos = y_series[-(n_ciclos * sp):]
+        blocos = ultimos.reshape(n_ciclos, sp)
+        media_por_mes = np.mean(blocos, axis=0)
+        media_geral = np.mean(media_por_mes)
+
+        if media_geral <= 0:
+            return forecast
+
+        indices_sazonais = media_por_mes / media_geral
+
+        forecast_corrigido = np.copy(forecast).astype(float)
+        for i in range(len(forecast)):
+            idx_mes = i % sp
+            forecast_corrigido[i] = forecast[i] * indices_sazonais[idx_mes]
+
+    # Reescala para preservar o total original
+    soma_original = np.sum(forecast)
+    soma_corrigido = np.sum(forecast_corrigido)
+    if soma_corrigido > 0:
+        forecast_corrigido = forecast_corrigido * (soma_original / soma_corrigido)
+
+    return np.maximum(forecast_corrigido, 0)
 
 def select_best_model(y_series: np.ndarray, dates: pd.DatetimeIndex, debug_info: str = None) -> Tuple[Optional[BaseForecastModel], Dict[str, Any]]:
     y_series = np.array(y_series).flatten()
@@ -1074,7 +1156,8 @@ def select_best_model(y_series: np.ndarray, dates: pd.DatetimeIndex, debug_info:
         comparison = {
             'modelo': best_model_name, 'wmape': best_result['wmape_mean'], 'wmape_std': best_result['wmape_std'],
             'aicc': best_result['aicc_mean'], 'all_results': results, 'errors': errors_debug if CONFIG.debug else {},
-            'rejected_flat': rejected_flat
+            'rejected_flat': rejected_flat,
+            'needs_seasonal_rescue': True  # Sinaliza que previsão é flat e precisa de correção sazonal
         }
         return final_model, comparison
 
@@ -1191,7 +1274,21 @@ def process_group(group_data: pd.DataFrame, fornecedor: str, categoria: str, glo
             # Corta qualquer número que ultrapasse o teto absoluto
             forecast = np.minimum(forecast, teto_absoluto)
             # -------------------------------------------------------------
-            
+
+            # -------------------------------------------------------------
+            # RESGATE SAZONAL: Se a previsão final ainda é chapada mas o
+            # histórico tem sazonalidade, injeta os índices sazonais para
+            # restaurar a oscilação natural do negócio.
+            # -------------------------------------------------------------
+            rejeitado_final, _ = _is_forecast_flat(y_series, forecast)
+            if rejeitado_final or comparison.get('needs_seasonal_rescue', False):
+                forecast = _apply_seasonal_indices(y_series, forecast, dates)
+                # Reaplica o teto após correção sazonal
+                forecast = np.minimum(forecast, teto_absoluto)
+                if comparison.get('modelo', '') not in ('ETS (Forçado Sazonal)',):
+                    comparison['modelo'] = comparison.get('modelo', '') + ' +Sazonal'
+            # -------------------------------------------------------------
+
         except Exception:
             group_data['Data'] = dates
             group_data['ano'] = group_data['ano_mes'].str[:4].astype(int)
@@ -1204,7 +1301,13 @@ def process_group(group_data: pd.DataFrame, fornecedor: str, categoria: str, glo
     wmape_vencedor = comparison.get('wmape', np.nan)
     future_dates = pd.date_range(start=dates.iloc[-1] + pd.DateOffset(months=1), periods=CONFIG.forecast_horizon, freq='MS')
 
-    nome_modelo = 'ETS (Forçado Sazonal)' if comparison.get('modelo') == 'ETS (Forçado Sazonal)' else best_model.get_info()
+    modelo_comp = comparison.get('modelo', '')
+    if modelo_comp == 'ETS (Forçado Sazonal)':
+        nome_modelo = 'ETS (Forçado Sazonal)'
+    elif '+Sazonal' in modelo_comp:
+        nome_modelo = modelo_comp
+    else:
+        nome_modelo = best_model.get_info()
 
     df_forecast = pd.DataFrame({
         'fornecedor comercial': fornecedor, 'categoria': categoria,
